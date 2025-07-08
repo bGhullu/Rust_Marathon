@@ -32,7 +32,16 @@ fn main (){
         println!("{}", a as u8);
     }
 
-    assert!(1u32 + 2 ==3);
+    assert!(1u32 + 2u32 ==3);
+
+    let t: (String, String)=(String::from("hello"), String::from("world"));
+
+    let (ref s1, ref s2) = t;
+    println!("{:?}, {:?},{:?}",s1,s2,t);
+
+    let (s3,s4) = t.clone();
+    println!("{:?},{:?},{:?}",s3,s4,t);
+
 }
 
 
