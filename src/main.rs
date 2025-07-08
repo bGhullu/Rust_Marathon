@@ -42,6 +42,9 @@ fn main (){
     let (s3,s4) = t.clone();
     println!("{:?},{:?},{:?}",s3,s4,t);
 
+    let byte_escape = "I'm writing Ru\x73\x74!";
+    println!("What are you doing \x3F ( \\x3F means ?) {}", byte_escape);
+
 }
 
 
