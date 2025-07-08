@@ -1,3 +1,68 @@
+
+#[allow(unused_variables)]
+fn main (){
+    let x: i32 = 5;
+    print!("x:{}",x);
+    println!("\n{value} shifted is {value:#x}", value = 42);
+    println!("x:{:?}",x);
+    println!("x:{:#?}",x);
+    println!("x:{:.3}",x);
+
+    let greeting = String::from("Hello world!");
+    println!("{}", greeting);
+
+    let x = 5;
+
+    assert_eq!(x, 5);
+
+    let y: i32;
+
+    let (x, y);
+
+    (x,..) = (3,4);
+    [..,y] = [1,2];
+
+    assert_eq!([x,y], [3,2]);
+    println!("Success!");
+
+    let v: u16 = 38_u8 as u16;
+    println!("Success!");
+
+    for a in 'a' .. 'd'{
+        println!("{}", a as u8);
+    }
+
+    assert!(1u32 + 2 ==3);
+}
+
+
+
+// use std::fs::read_to_string;
+
+// fn main(){
+
+//     let result= read_to_string( "a.txt");
+//     match result{
+//         Ok(data)=> println!("{}",data),
+//         Err(err) => println!("{}",err),
+//     }
+
+//     let read_data = read_from_file (String::from("a.txt"));
+//     println!("{}",read_data);
+
+// }
+
+// fn read_from_file(file_path: String) -> String {
+//     let result = read_to_string(file_path);
+//     match result {
+//         Ok(data) => data,
+//         Err(err)=> String::from("-1"),
+//     }
+// }
+
+
+
+
 // fn main (){
 //     let index = find_first_a(String::from("RUST"));
 
