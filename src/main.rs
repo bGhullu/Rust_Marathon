@@ -1,5 +1,10 @@
 
 #[allow(unused_variables)]
+
+struct Person{
+    name: String,
+    age: u8,
+}
 fn main (){
     let x: i32 = 5;
     print!("x:{}",x);
@@ -45,7 +50,54 @@ fn main (){
     let byte_escape = "I'm writing Ru\x73\x74!";
     println!("What are you doing \x3F ( \\x3F means ?) {}", byte_escape);
 
+    let unicode_codepoint = "\u{211D}";
+    let character_name = "\"DOUBLE-STRUCK CAPITAL R\"";
+
+    // ------------- Arrays ---------------------------
+
+    let names: [String; 2] = [String::from("hello"), String::from("world!")];
+    let numbers:[i32;3]= [1,2,3];
+
+
+
+    
+    // ------------- Flow Control ---------------------
+
+    for name in &names {
+        println!("{}", name)
+    }
+
+    println!("{:?}", names);
+
+     for n in numbers{
+        println!("{}", n);
+    }
+
+    let ae:[i32;4]= [1,2,3,4,];
+    for (i,v) in ae.iter().enumerate() {
+        println!("The {}th element is {}", i+1, v);
+    }
+
+    println!("{:?}", numbers);
+
+    for n in 1..100{
+        if n == 100{
+            panic!("Never let this Run!")
+        }
+    }
+
+    println!("Success!");
+    
+   
+
+
+
 }
+
+fn build_person(name: String, age: u8) -> Person {
+    Person { age, name, }
+}
+
 
 
 
