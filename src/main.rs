@@ -1,9 +1,33 @@
+use core::panic::PanicMessage;
+
 
 #[allow(unused_variables)]
 
 struct Person{
     name: String,
     age: u8,
+}
+
+enum Message {
+        Quit,
+        Move {x:i32, y:i32},
+        Write(String),
+        ChangeColor(i32,i32,i32),
+}
+
+enum MyEnum{
+        Foo,
+        Bar
+}
+
+enum Foo{
+    Bar(u8)
+}
+
+enum Foo1{
+    Bar, 
+    Baz,
+    Qux(u32)
 }
 fn main (){
     let x: i32 = 5;
@@ -60,8 +84,29 @@ fn main (){
 
 
 
-    
+
     // ------------- Flow Control ---------------------
+
+    let   (mut n, mut y): (i32, i32) = (0,0);
+    for i in 0..=100{
+        if n ==66 {
+            break;
+        }
+        n +=1;
+    }
+
+    for j in 0..100{
+        if y!= 22{
+            y+=1;
+            continue;
+        }
+        break;
+    }
+    println!("The value of y is: {}", y);
+    
+
+    assert_eq!(n, 66);
+    println!("The value of n is: {}",n);
 
     for name in &names {
         println!("{}", name)
@@ -87,11 +132,199 @@ fn main (){
     }
 
     println!("Success!");
+
+    let mut count: u32 = 0u32;
+    println!("Let's count until infinity!");
+    loop{
+        count +=1;
+        if count ==3 {
+            println!("Three");
+            continue;
+        }
+        println!("The count is:{}", count);
+
+        if count == 5 {
+            println!("Ok! that's enough.");
+            break;
+        }
+    }
     
-   
+    let mut counter: i32 = 0;
+
+    let result:i32 = loop{
+        counter+=1;
+        if counter == 10{
+            break counter *2;
+        }  
+    };
+
+    println!("The value of result is: {}", result);
+    
+   let mut inner_outer: i32 = 0;
+
+   'outer: loop{
+        'inner1: loop{
+            if inner_outer>= 20{
+                // This would break only the inner1 loop
+                break 'inner1; // `break` is also works.
+            }
+            inner_outer+=2;
+        }
+        inner_outer+=5;
+        'inner2: loop{
+            if inner_outer >=30 {
+                // This breaks the outer loop
+                break 'outer;
+            }
+            // This will continue the outer loop
+            continue 'outer;
+        }
+   }
+
+   println!("The value of inner_outer loop variable is {}:", inner_outer);
+
+//------------------ Pattern Match ---------------------------
+
+    enum Coin {
+        Penny,
+        Quid,
+        Fiver,
+        Tenner,
+    }
+
+    fn value_in_pound(coin: Coin) -> f64{
+        match coin{
+            Coin::Penny => 0.01,
+            Coin::Quid => 1.0,
+            Coin::Fiver => 5.0,
+            Coin::Tenner =>10.0,
+        }
+    }
+
+    // -------------------- if let ---------------------------------
+
+    let config_max = Some(3u8);
+    match config_max{
+        Some(max)=> println!("The max is configured to be {}:",max),
+        _ => (),
+    }
+
+    if let Some(max) = config_max{
+        println!("The maximum is configured to be {}:", max);
+    }
+
+    enum Direction {
+        East,
+        West,
+        North,
+        South,
+    }
+
+    let dire: Direction = Direction::South;
+    match dire{
+        Direction::East => println!("East"),
+        Direction::South | Direction::North => {
+            println!("SOuth or North");
+        },
+        _ => println!("West"),
+    }
+
+    let boolean = true;
+
+    let binary = match boolean {
+        true => 1,
+        false => 0,
+    };
+
+    println!("The binary value is {}:", binary);
+
+ 
+
+    let msgs:[Message;3]= [
+        Message::Quit,
+        Message::Move{x:1, y:3},
+        Message::ChangeColor(255,255, 0),
+    ];
+
+    for msg in msgs{
+        show_message(msg)
+    }
+
+    let alphabets = ['a','E','Z','0','x','9','Y'];
+    for ab in alphabets{
+        assert!(matches!(ab,'A'..='Z' | 'a'..='z' | '0'..='9'));
+    }
+
+    let mut count1 =0;
+    let v = vec![MyEnum::Foo, MyEnum::Bar, MyEnum::Foo];
+    for e in v {
+        if matches!(e,MyEnum::Foo){
+            count1 +=1;
+        }
+    }
+
+    println!("The count for MyEnum::Foo is: {}", count1);
+
+    // ------- For some cases, when matching enums, match is too heavy.
+    // ------- We can use if let instead
+    let o: Option<i32> = Some(7);
+
+    match o{
+        Some(i) =>{
+            println!("This is a really long string and {:?}", i);
+        
+        }
+        _ => {}
+    };
+
+    if let Some(i) = o{
+        println!("This is a really long string and `{:?}`", i);
+    }
+
+    let a = Foo::Bar(1);
+    if let Foo::Bar(i) = a {
+        println!("Foobar hold the value: {}", i );
+    }
+  
+    let a = Foo1::Qux(10);
+
+    if let Foo1::Bar = a {
+        println!("match foo1::bar")
+    }else if let Foo1::Baz = a {
+        println!("match foo1::baz")
+    }else{
+        println!("match others")
+    }
+    
+    match a {
+        Foo1::Bar => println!("match foo::bar"),
+        Foo1::Baz => println!("match foo::baz"),
+        _ => println!("match others")
+    }
 
 
 
+}
+
+  
+
+fn show_message(msg: Message){
+    match msg{
+        Message::Move{x:a,y:b} => {
+            assert_eq!(a, 1);
+            assert_eq!(b, 3);
+            println!("a: {} and b: {}", a, b);
+        },
+        Message::ChangeColor(r,g ,b )=>{
+            assert_eq!(g,255);
+            assert_eq!(b,0);
+            println!("R,G,B:{},{},{}", r,g,b);
+        },
+        _ => println!("no data in these variants")
+    }
+    
+
+ 
 }
 
 fn build_person(name: String, age: u8) -> Person {
