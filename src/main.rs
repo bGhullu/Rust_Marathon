@@ -192,7 +192,7 @@ impl <T> Pair<T>{
     }
 }
 
-impl<T: std::fmt::Debug + PartialOrd +PartialEq > Pair<T>{
+impl<T: std::fmt::Debug + PartialOrd + PartialEq > Pair<T>{
     fn cm_display(&self){
         if self.x >= self.y {
             println!("The largest member is x = {:?}", self.x);
@@ -204,7 +204,143 @@ impl<T: std::fmt::Debug + PartialOrd +PartialEq > Pair<T>{
 #[derive(Debug, PartialEq, PartialOrd)]
 struct Unit(i32);
 
+// ................... Trait Object ...................................
+
+trait Bird {
+    fn quack(&self) -> String;
+    fn sound(&self);
+}
+
+struct Duck;
+impl Duck {
+    fn swim(&self) {
+        println!("Look, the duck is swimming!");
+    }
+}
+
+struct Swan;
+impl Swan{
+    fn fly(&self){
+        println!("Look, The duck .. oh sorry, the swam is flying!");
+    }
+}
+
+impl Bird for Duck{
+    fn quack(&self)-> String{
+        "duck duck".to_string()
+    }
+    fn sound(&self){
+        println!("{}","duck duck")
+    }
+}
+
+impl Bird for Swan{
+    fn quack(&self)-> String{
+        "swan swan".to_string()
+    }
+
+    fn sound(&self) {
+        println!("{}", "swan swan")
+    }
+}
+
+// ......................  &dyn and Box<dyn> .........................
+
+trait Draw{
+    fn draw (&self) -> String;
+}
+
+impl Draw for u8{
+    fn draw(&self) -> String{
+        format!("u8:{}",self)
+    }
+}
+
+impl Draw for f64{
+    fn draw(&self)-> String{
+        format!("f64:{}",self)
+    }
+}
+
+trait Fooo{
+    fn method(&self) -> String;
+}
+
+impl Fooo for u8{
+    fn method(&self) -> String {format!("u8: {}", self)}
+}
+
+impl Fooo for String{
+    fn method(&self) -> String {
+        format!("string: {}", self)
+    }
+}
+
+fn static_dispatc < T: Fooo> (a: T) -> String{
+    a.method()
+    
+}
+
+fn dynamic_dispatch(x: Box<dyn Fooo>)-> String {
+    x.method()
+    
+}
+
+
+// ................. Object Safe .............................
+
+trait MyTrait{
+    fn f(&self)-> Box <dyn MyTrait>;
+}
+
+impl MyTrait for u32{
+    fn f(&self) -> Box<dyn MyTrait> {Box::new(42)}
+}
+
+impl MyTrait for String{
+    fn f(&self) -> Box<dyn MyTrait>{Box::new(self.clone())}
+}
+
+fn my_function(x: Box<dyn MyTrait>) ->Box<dyn MyTrait> {
+    x.f()
+}
+
 fn main (){
+
+    let x1: u8 = 5u8;
+    let y: String = "Hello".to_string();
+    static_dispatc(x1);
+    dynamic_dispatch(Box::new(y));
+    
+    my_function(Box::new(12_u32));
+    my_function(Box::new(String::from("abe")));
+
+    let x = 1.1f64;
+    let y =8u8;
+
+    // Draw x
+    draw_with_box(Box::new(x));
+
+    // Draw y
+    draw_with_ref(&y);
+
+    
+    let birds:[&dyn Bird;2] = [&Duck,&Swan];
+    for bird in birds {
+        bird.sound();
+    }
+    let duck = Duck;
+    duck.swim();
+
+    let swan = Swan;
+    swan.fly();
+
+    let bird = hatch_a_bird(2);
+    assert_eq!(bird.quack(), "duck duck");
+
+    let bird = hatch_a_bird(1);
+    assert_eq!(bird.quack(),"swan swan");
+
 
  
     let pair = Pair::new(Unit(1), Unit(2));
@@ -270,6 +406,22 @@ fn main (){
     println!("You've randomly chosen an animal, and it says {}",animal.noise());
 
    
+}
+
+fn draw_with_box(x: Box<dyn Draw>) {
+    x.draw();
+}
+
+fn draw_with_ref(x: &dyn Draw){
+    x.draw();
+}
+
+fn hatch_a_bird(species: u8) -> Box<dyn Bird> {
+    match species{
+        1=> Box::new(Swan),
+        2=> Box::new(Duck),
+        _=> panic! (),
+    }
 }
 
 fn summary<T: Summary>(a: &T){
