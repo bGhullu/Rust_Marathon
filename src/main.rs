@@ -70,6 +70,53 @@ impl Hello for Teacher{
     }
 }
 
+// ...... Derive .......
+
+#[derive(PartialEq, PartialOrd)]
+struct Centimeters(f64);
+
+#[derive(Debug)]
+struct Inches(i32);
+
+impl Inches {
+    fn to_centimeters(&self) -> Centimeters{
+        let &Inches(inches)= self;
+        Centimeters(inches as f64 * 2.54)
+    }
+}
+#[derive(Debug, PartialEq, PartialOrd )]
+struct Seconds(i32);
+
+//......... Operator .......
+
+use std::ops;
+
+fn multiply<T: std::ops::Mul <Output = T>>(x: T, y: T) -> T{
+    x * y
+}
+
+struct Foo;
+struct Bar;
+#[derive(Debug,PartialEq)]
+struct FooBar;
+#[derive(Debug,PartialEq)]
+struct BarFoo;
+
+impl ops::Add<Bar> for Foo{
+    type Output = FooBar;
+    fn add(self, _rhs:Bar) -> FooBar{
+        FooBar
+    }
+}
+
+impl ops::Sub<Bar> for Foo{
+    type Output = BarFoo;
+    fn sub(self, _rhs:Bar) -> BarFoo{
+        BarFoo
+    }
+}
+
+//....... as Function Parameters ..................
 
 fn main (){
 
@@ -81,6 +128,33 @@ fn main (){
     assert_eq!(t.say_something(),"I'm not a bad teacher");
 
     println!("Success!");
+
+    let _one_second = Seconds(1);
+    println!("One second lookks like: {:?}", _one_second);
+    let _this_is_true = _one_second ==_one_second;
+    let _this_is_false = _one_second > _one_second;
+    println!("{}",_this_is_true);
+    println!("{}",_this_is_false);
+
+    let foot = Inches(12);
+    println!("One foot equal {:?}", foot);
+
+    let meter = Centimeters(100.0);
+    let cmp =
+        if foot.to_centimeters() < meter{
+            "smaller"
+        }else{
+            "bigger"
+        };
+    println!("One foot is {} than one meter.", cmp);
+    
+    assert_eq!(6, multiply(2u8, 3u8));
+    assert_eq!(5.0, multiply(1.0, 5.0));
+
+    assert_eq!(Foo + Bar, FooBar);
+    assert_eq!(Foo - Bar, BarFoo);
+
+   
 }
 
 
