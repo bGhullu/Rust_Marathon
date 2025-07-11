@@ -89,7 +89,7 @@ struct Seconds(i32);
 
 //......... Operator .......
 
-use std::ops;
+use std::{hash::RandomState, ops};
 
 fn multiply<T: std::ops::Mul <Output = T>>(x: T, y: T) -> T{
     x * y
@@ -118,6 +118,61 @@ impl ops::Sub<Bar> for Foo{
 
 //....... as Function Parameters ..................
 
+trait Summary {
+    fn summarize(&self) -> String;
+}
+
+#[derive(Debug)]
+struct Post{
+    title: String,
+    author: String,
+    content: String,
+}
+impl Summary for Post{
+    fn summarize(&self) -> String {
+        format!("The author of post {} is {}", self.title, self.author)
+    }
+}
+#[derive(Debug)]
+struct Weibo {
+    username: String,
+    content: String,
+}
+
+impl Summary for Weibo{
+    fn summarize(&self) -> String {
+        format!("{} published a weibo {}", self.username,self.content)
+    }
+}
+
+//................. Returning Types that Immplements Traits ..........................
+
+struct Sheep{}
+struct Cow{}
+
+trait Animal {
+    fn noise(&self) -> String;
+}
+
+impl Animal for Sheep{
+    fn noise(&self) -> String{
+        String::from("baahhh!")
+    }
+}
+
+impl Animal for Cow {
+    fn noise(&self) -> String{
+        String::from("Mooooooo!")
+    }
+}
+
+fn random_animal(random_number: f64) -> &dyn Animal{
+    if random_number < 0.5{
+        Sheep{}
+    }else{
+        Cow{}
+    }
+}
 fn main (){
 
     let s: Student= Student {  };
@@ -154,7 +209,32 @@ fn main (){
     assert_eq!(Foo + Bar, FooBar);
     assert_eq!(Foo - Bar, BarFoo);
 
+    let post: Post = Post { 
+        title: "Popular Rust".to_string(), 
+        author: "Sunface".to_string(),
+        content: "Rust is awesoem!".to_string()
+    };
+    let weibo: Weibo = Weibo { 
+        username: "surface".to_string() , 
+        content:  "Weibo seems to be worse than X".to_string(),
+    };
+    
+    summary(&post);
+    summary(&weibo);
+
+    println!("{:?}", post);
+    println!("{:?}",weibo);
+
+    let random_number = 0.234;
+    let animal= random_animal(random_number);
+    println!("You've randomly chosen an animal, and it says {}",animal.noise());
+
    
+}
+
+fn summary<T: Summary>(a: &T){
+   let output: String =  a.summarize();
+   println!("{}", output);
 }
 
 
