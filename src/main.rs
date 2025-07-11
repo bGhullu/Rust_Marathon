@@ -89,7 +89,7 @@ struct Seconds(i32);
 
 //......... Operator .......
 
-use std::{hash::RandomState, ops};
+use std::{default, hash::RandomState, ops};
 
 fn multiply<T: std::ops::Mul <Output = T>>(x: T, y: T) -> T{
     x * y
@@ -166,14 +166,54 @@ impl Animal for Cow {
     }
 }
 
-fn random_animal(random_number: f64) -> &dyn Animal{
+fn random_animal(random_number: f64) -> Box<dyn Animal>{
     if random_number < 0.5{
-        Sheep{}
+        Box::new(Sheep{})
     }else{
-        Cow{}
+        Box::new(Cow{})
     }
 }
+
+fn sum<T: std::ops::Add<Output = T>>(x:T, y:T) -> T {
+    x+y
+}
+
+struct Pair<T>{
+    x: T,
+    y: T,
+}
+
+impl <T> Pair<T>{
+    fn new(x:T, y:T) -> Self{
+        Self { 
+           x,
+           y,
+         }
+    }
+}
+
+impl<T: std::fmt::Debug + PartialOrd +PartialEq > Pair<T>{
+    fn cm_display(&self){
+        if self.x >= self.y {
+            println!("The largest member is x = {:?}", self.x);
+        }else {
+            println!("The largest member is y = {:?}", self.y);
+        }
+    }
+}
+#[derive(Debug, PartialEq, PartialOrd)]
+struct Unit(i32);
+
 fn main (){
+
+ 
+    let pair = Pair::new(Unit(1), Unit(2));
+
+    pair.cm_display();
+
+
+    assert_eq!(sum(1,2), 3);
+    println!("{}", sum(5.0,1.0));
 
     let s: Student= Student {  };
     assert_eq!(s.say_hi(), "Hi!");
