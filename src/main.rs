@@ -8,6 +8,15 @@
 
 */
 
+struct MyStruct0<F:  FnMut(i32)->i32>{
+    callback: F,
+}
+
+impl<F: FnMut(i32)->i32> MyStruct0<F>{
+    fn call(&mut self, input: i32)->i32{
+        (self.callback)(input)
+    }
+}
 struct MyStruct<F>
 where
     F: Fn(i32) -> i32,
@@ -36,7 +45,14 @@ where
 }    
 
 fn main(){
-
+    let mut counter =100;
+    let sub_one=  move |x| {
+        counter -=x;
+        counter
+    };
+    let mut obj0=MyStruct0{callback:sub_one};
+    let result0=obj0.call(10);
+    println!("Result:{}", result0);
 
     let add_five = |x| x + 5;
 
