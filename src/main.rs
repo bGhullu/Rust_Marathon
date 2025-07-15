@@ -8,6 +8,24 @@
 
 */
 
+struct MyStruct<F>
+where
+    F: Fn(i32) -> i32,
+{
+    callback: F,
+}
+
+impl<F> MyStruct<F>
+where
+    F: Fn(i32) -> i32,
+{
+    fn call(&self, input: i32) -> i32 {
+        (self.callback)(input)
+    }
+}
+
+
+
 
 fn fn_once<F>(func: F)
 where 
@@ -18,6 +36,14 @@ where
 }    
 
 fn main(){
+
+
+    let add_five = |x| x + 5;
+
+    let obj = MyStruct { callback: add_five };
+
+    let result = obj.call(10); // 10 + 5 = 15
+    println!("Result: {}", result);
 
     let x: Vec<i32> = vec![1,2,3];
     fn_once(|z|{
@@ -55,6 +81,33 @@ fn main(){
 
     println!("{}", s);
 
+
+    let x = String::from("hello");
+
+    let closure = move || println!("{}", x); // ??
+    funct(closure);   
+
+    let fn_plain0= create_fn0();
+    let result0 =fn_plain0(1);
+    println!("{}", result0);
+    let fn_plain = create_fn();  // fn_plain = |x| x+ num;
+
+    let result = fn_plain(1); //6
+    println!("{}",result);
+
+}
+
+fn create_fn0()-> Box< dyn Fn(i32)->i32>{
+    let num: i32 =4;
+   Box::new( move |x| x+ num)
+}
+fn create_fn()-> impl Fn(i32) -> i32 {
+    let num: i32 = 5;
+
+    move |x| x+num
+}
+fn funct<F: Fn()>(f: F) {
+    f();
 }
 
 fn exec<'a, F>(mut f: F)
