@@ -26,6 +26,7 @@ impl<'a> Iterator for StrSplit<'a>{
 
     /// Returns the next substring until the delimiter, or `None` if done.
     fn next(&mut self)-> Option<Self::Item>{
+        println!("Calling .next() on StrSplit");
         if let Some(next_delim)= self.remainder.find(self.delimiter){
             let until_delimeter = &self.remainder[..next_delim];
             self.remainder= &self.remainder[(next_delim + self.delimiter.len())..];
@@ -44,6 +45,6 @@ impl<'a> Iterator for StrSplit<'a>{
 #[test]
 fn it_works() {
     let haystack = "a b c d e";
-    let letters = StrSplit::new(haystack,  " ");
-    assert!(letters.eq(vec!["a", "b", "c", "d", "e"].into_iter()));
+    let letters: Vec<_> = StrSplit::new(haystack,  " ").collect();
+    assert_eq!(letters, vec!["a", "b", "c", "d", "e"]);
 }
