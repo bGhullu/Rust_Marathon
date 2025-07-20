@@ -3,7 +3,7 @@
 //! It includes the `StrSplit` struct, which implements the `Iterator` trait.
 #![warn(missing_debug_implementations, rust_2018_idioms,missing_docs)]
 
-use std::ops::RemAssign;
+
 
 
 /// An iterator that splits a string by a delimiter.
@@ -29,9 +29,9 @@ impl<'a> Iterator for StrSplit<'a>{
     /// Returns the next substring until the delimiter, or `None` if done.
     fn next(&mut self)-> Option<Self::Item>{
 
-        let ref mut remainder= self.remainder?; // let remainder = &mut self.remainder;
+        let  remainder= self.remainder.as_mut()?; 
             if let Some(next_delim)= remainder.find(self.delimiter){
-                let until_delimeter = &.remainder[..next_delim];
+                let until_delimeter = &remainder[..next_delim];
                 *remainder= &remainder[(next_delim + self.delimiter.len())..];
                 Some(until_delimeter)
             
