@@ -8,14 +8,15 @@
 
 /// An iterator that splits a string by a delimiter.
 #[derive(Debug)]
-pub struct StrSplit<'a>{
-    remainder: Option<&'a str>,
-    delimiter: &'a str,
+pub struct StrSplit<'haystack,D>{
+    remainder: Option<&'haystack str>,
+    // delimiter: &'haystack str,
+    delimiter: D
 }
 // implement struct
-impl<'a> StrSplit<'a>{
+impl<'haystack, D> StrSplit<'haystack,D>{
         /// Creates a new `StrSplit` iterator over `haystack`, splitting by `delimiter`.
-    pub fn new(haystack: &'a str, delimiter: &'a str) -> Self{
+    pub fn new(haystack: &'haystack str, delimiter: D) -> Self{
         Self { 
             remainder: Some(haystack),
             delimiter,
@@ -23,16 +24,23 @@ impl<'a> StrSplit<'a>{
     }
 }
 
-impl<'a> Iterator for StrSplit<'a>{
-    type Item= &'a str;
+//Delimiter Trait for finding first and last delimeter
+pub trait Delimiter {
+    fn find_next(&self, s: &str)-> Option<(usize, usize)>;
+}
+
+impl<'haystack,D> Iterator for StrSplit<'haystack,D>
+where D: Delimiter,
+{
+    type Item= &'haystack str;
 
     /// Returns the next substring until the delimiter, or `None` if done.
     fn next(&mut self)-> Option<Self::Item>{
 
         let  remainder= self.remainder.as_mut()?; 
-            if let Some(next_delim)= remainder.find(self.delimiter){
-                let until_delimeter = &remainder[..next_delim];
-                *remainder= &remainder[(next_delim + self.delimiter.len())..];
+            if let Some((delim_start, delim_end))= self.delimiter.find_next(remainder){
+                let until_delimeter = &remainder[..delim_start];
+                *remainder= &remainder[delim_end..];
                 Some(until_delimeter)
             
             }else {
@@ -40,6 +48,15 @@ impl<'a> Iterator for StrSplit<'a>{
             } 
     }    
 }   
+
+
+//Delimiter Trait for finding first and last delimeter
+impl Delimiter for &str {
+    fn find_next(&self, s: &str) -> Option <(usize, usize)>{
+        s.find(self).map(|start| (start, start + self.len()))
+    }
+}
+
 
 
 
