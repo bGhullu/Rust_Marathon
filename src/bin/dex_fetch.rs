@@ -3,8 +3,10 @@ use dotenv::dotenv;
 use ethers::prelude::*;
 use serde::Deserialize;
 use tokio::time::{timeout, Duration};
-use std::{str::FromStr, time};
-
+use std::str::FromStr;
+use std::sync::Arc;
+use ethers::abi::Abi;
+use ethers::types::U256;
 
 
 #[derive(Debug,Deserialize)]
@@ -25,12 +27,44 @@ async fn main () -> Result<()>{
         format!("https://mainnet.infura.io/v3/{}", infura_key)
     )?;
 
+    let provdier = Arc::new(provider);
     let uniswap_address: Address= H160::from_str("0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8")?;
-    let contract = Contract::from_json(&provider,uniswap_address, include_bytes!("uniswap_v3_pool.json"))?;
-
-    let slot0: (U256, i32) = match timeout(Duration::from_secs(5), contract.method::<_,(U256, i32)>("slot0", ())?.call()).await {
-
+    let abi: Abi = serde_json::from_slice(include_bytes!("../../uniswap_v3_pool.json"))
+        .map_err(|e| anyhow::anyhow!("Failed to parse ABI: {}",e))?;
+    let contract= Contract::new(uniswap_address,abi, provdier.clone());
+    println!("Contract Initialized");
+    let slot0: (U256, i32) = match timeout(Duration::from_secs(5),
+         contract.method::<(),(U256, i32)>("slot0", ())?.call()
+    ).await {
+        Ok(Ok(slot0))=> slot0,
+        Ok(Err(e))=> return Err(anyhow::anyhow!("slot0 call failed: {}",e)),
+        Err(_)=> return Err(anyhow::anyhow!("slot0 call timed out after 5s")),
     };
+
+    let slot0_data = Slot0{
+        sqrt_price_x96: slot0.0,
+        tick: slot0.1,
+    };
+    println!("Uniswap slot0:{:?}", slot0_data);
+
+
+let scale_6 = U256::exp10(6);   // 10^6
+let scale_18 = U256::exp10(18); // 10^18
+let denom = U256::from(2).pow(U256::from(192)) * scale_18;
+
+let sqrt_price = slot0_data.sqrt_price_x96; // U256 from on-chain data
+
+// price = (sqrtPriceX96 ^ 2 * 10^6) / (2^192 * 10^18)
+let numerator = sqrt_price.checked_mul(sqrt_price)
+    .and_then(|v| v.checked_mul(scale_6))
+    .expect("Multiplication overflow");
+
+let price_u256 = numerator.checked_div(denom).expect("Division by zero");
+
+// convert to f64 for human-readable display:
+let price_float = price_u256.as_u128() as f64 / 1_000_000f64;
+
+println!("ETH/USDC price: {}", price_float);
 
 
     Ok(())
