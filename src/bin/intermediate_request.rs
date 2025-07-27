@@ -129,4 +129,3 @@ async fn fetch_coinmarketcap_price(client: &Client) -> Result<f64>{
 }
 
 
-
