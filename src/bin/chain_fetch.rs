@@ -6,7 +6,9 @@ use ethers::prelude::*;
 use tokio::sync::mpsc;
 use primitive_types::U256;
 use  tokio::time::{timeout,Duration};
-use std::str::FromStr; // for H160 parsing
+use std::str::FromStr;
+
+
 
 #[tokio::main]
 
@@ -79,9 +81,9 @@ async fn fetch_eth_data(provider: &Provider<Http>)-> Result<(u64,u64,U256)>{
     let block = provider.get_block(BlockNumber::Latest).await?.ok_or_else(|| anyhow::anyhow!("No block found"))?;
     let block_number = block.number.ok_or_else(|| anyhow::anyhow!("No block number"))?.as_u64();
     let timestamp = block.timestamp.as_u64();
-    let address: H160= "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".parse()?;
-    let balance =provider.get_balance(address, None).await?;
-    // let balance = provider.get_balance(H160::from_str("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")?.into(),None).await?;
+    // let address: H160= "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".parse()?;
+    // let balance =provider.get_balance(address, None).await?;
+     let balance = provider.get_balance(H160::from_str("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")?,None).await?;
     Ok((block_number,timestamp, balance))
 }
 
@@ -89,8 +91,8 @@ async fn fetch_arb_data(provider: &Provider<Http>) -> Result<(u64,u64,U256)> {
     let block = provider.get_block(BlockNumber::Latest).await?.ok_or_else(|| anyhow::anyhow!("No block found"))?;
     let block_number= block.number.ok_or_else(|| anyhow::anyhow!("No block number"))?.as_u64();
     let timestamp = block.timestamp.as_u64();
-    let address:H160= "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".parse()?;
-    let balance = provider.get_balance(address,None).await?;
-    // let balance= provider.get_balance(H160::from_str("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")?.into(),None).await?;
+    // let address:H160= "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".parse()?;
+    // let balance = provider.get_balance(address,None).await?;
+    let balance= provider.get_balance(H160::from_str("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")?,None).await?;
     Ok((block_number, timestamp, balance))
 }

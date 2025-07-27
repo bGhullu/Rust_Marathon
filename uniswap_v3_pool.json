@@ -1,0 +1,3 @@
+[
+  {"type":"function","name":"slot0","inputs":[],"outputs":[{"name":"sqrtPriceX96","type":"uint160"},{"name":"tick","type":"int24"}]}
+]
