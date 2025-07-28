@@ -53,16 +53,18 @@ async fn main () -> Result<()>{
     // let q96 = 2_f64.powf(96.0);
     // let price_raw = (sqrt_price_64/q96).powf(2.0);
     // let price_adjusted = price_raw* 10_f64.powf(18.0-6.0);
-
     // println!("USDC per WETH: {:.2}",price_adjusted);
     // println!("ETH price: ${:.2}", price_adjusted);
- // Convert sqrtPriceX96 to USDC/WETH price
+
     let sqrt_price = slot0_data.sqrt_price_x96;
     // Step 1: Compute sqrt_price^2 / 10^18 to reduce magnitude
-    let denominator = (sqrt_price * sqrt_price) / U256::from(10).pow(U256::from(18));
+    let denominator = (sqrt_price * sqrt_price) / U256::from(10).pow(U256::from(12));
     // Step 2: Compute (2^192 * 10^6) / denominator
     let price = (U256::from(1) << 192) * U256::from(10).pow(U256::from(6)) / denominator;
+  
     let price_float = price.as_u128() as f64 / 10u128.pow(6) as f64; // Adjust for USDC decimals
+
+  
     println!("USDC per WETH: {:.2}", price_float);
     println!("ETH price: ${:.2}", price_float);
 
