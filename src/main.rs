@@ -1,9 +1,14 @@
-use ethers::providers::{Http, Middleware, Provider, Ws};
-use std::sync::Arc;
+use ethers::{
+    types:: Transaction,
+    providers::{Http, Middleware, Provider, Ws}
+};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc
+};
 use anyhow::{Result, Context};
-use ethers::types::{Block, Transaction};
 use futures::StreamExt;
-use tokio::sync::broadcast;
+
 
 
 #[derive(Clone)]
@@ -12,6 +17,7 @@ struct EthClient{
     http: Arc<Provider<Http>>,  
     ws: Arc<Provider<Ws>>,
     current_block: u64,
+    http_alive: Arc<AtomicBool>,
 }
 
 impl EthClient{
@@ -45,6 +51,7 @@ impl EthClient{
             http: Arc::new(http),
             ws: Arc::new(ws),
             current_block: http_block,
+            http_alive: Arc::new(AtomicBool::new(true)),
         })
 
     }
@@ -73,6 +80,21 @@ impl EthClient{
         self.http = Arc::new(Provider::<Http>::try_from("http://invalid.url").unwrap());
     }
 
+    pub async fn get_transaction(&self, tx_hash: ethers::types::TxHash) -> Result<Option<Transaction>>{
+        if self.http_alive.load(Ordering::SeqCst){
+            match self.http.get_transaction(tx_hash).await{
+                Ok(tx)=> Ok(tx),
+                Err(e)=>{
+                    eprintln!("HTTP failed, falling back to WS; {}", e);
+                    self.ws.get_transaction(tx_hash).await
+                        .context("Failed to get transaction via WS")
+                }
+            } 
+        } else {
+            self.ws.get_transaction(tx_hash).await
+                .context("Failed to get transaction via WS")
+        }
+    }
     pub async fn stream_blocks(&self) ->Result<()>{
         let mut stream = self.ws.subscribe_blocks().await?;
         while let Some(block) = stream.next().await{
@@ -89,7 +111,7 @@ impl EthClient{
     pub async fn stream_pending_txs(&self)->Result<()>{
         let mut stream = self.ws.subscribe_pending_txs().await?;
         while let Some(tx_hash) = stream.next().await{
-                match self.ws.get_transaction(tx_hash).await{
+                match self.get_transaction(tx_hash).await{
                     Ok(Some(tx))=>{
                         println!(
                             "Pending Tx: {} => {}, gas:{}, value:{} ETH",
@@ -119,7 +141,7 @@ async fn main()-> Result<()>{
     
     // Simulate HTTP failure
     println!("Simulate HTTP failure...");
-    client.kill_http();
+    // client.kill_http();
    
     // std::thread::sleep(std::time::Duration::from_secs(10));
 
