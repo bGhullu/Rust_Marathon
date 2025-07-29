@@ -1,122 +1,93 @@
-
-// -------------------- Iterator ------------------
-
-
-// pub trait Iterator{
-//     type Item;
-//     fn next(&mut self)-> Options<Self::Item>;
-
-// }
-
-//............................. Custom Iterator ...................................
+use ethers::{core::k256::pkcs8::der::asn1::PrintableString, providers::{Http, Middleware, Provider, Ws}};
+use std::sync::Arc;
+use anyhow::{Result, Context};
+use url::Url;
 
 
-struct Counter {
-    count: u32,
+/// Professional Ethereum client with failover
+struct EthClient{
+    http: Arc<Provider<Http>>,  
+    ws: Arc<Provider<Ws>>,
+    current_block: u64,
 }
 
-impl Counter{
-    fn new() -> Counter{
-        Counter { count: 0}
+impl EthClient{
+   /// Initialize with automatic health checks 
+    pub async fn new(rpc_url: &str,ws_url: &str) -> Result<Self>{
+        // 1. Initialize providers
+        let http = Provider::<Http>::try_from(rpc_url)
+            .context("Failed to create HTTP provide")?; // ----->why not await as ws
+        let ws = Provider::<Ws>::connect(ws_url)
+            .await
+            .context("Failed to connect to WS provider")?;
+        
+        // 2. Verify chain synchronization
+        let http_block = http.get_block_number()
+            .await
+            .context("HTTP block fetch failed")?
+            .as_u64();
+        let ws_block = http
+            .get_block_number()
+            .await
+            .context("WS block fetch failed")?
+            .as_u64();
+
+        if http_block.abs_diff(ws_block) > 3{
+            anyhow::bail!("Providers out of sync (HTTP: {}, ws:{})",http_block,ws_block);
+        }
+
+        // 3. Return initialized client
+        Ok(Self{
+            http: Arc::new(http),
+            ws: Arc::new(ws),
+            current_block: http_block,
+        })
+
     }
-}
-
-impl Iterator for Counter {
-    type Item = u32;
-
-    fn next(&mut self)-> Option<Self::Item>{
-        if self.count <5{
-            self.count += 1;
-            Some(self.count)
-        }else {
-            None
+    /// Get latest block with automatic retry
+    pub async fn get_block(&mut self) -> Result<u64>{
+        // Try HTTP first
+        match self.http.get_block_number().await{
+            Ok(block) => {
+                self.current_block = block.as_u64();
+                Ok(self.current_block)
+            },
+            Err(e) => {
+                // Fallback to websocket
+                eprintln!("HTTP failed, falling back to WS: {}", e);
+                let block = self.ws.get_block_number()
+                    .await?
+                    .as_u64();
+                self.current_block = block;
+                Ok(block)
+            }
         }
     }
-}
-
-struct Fibonacci{
-    curr: u32,
-    next: u32,
-}
-
-impl Iterator for Fibonacci{
-    type Item = u32;
-    fn next(&mut self) -> Option<Self::Item>{
-        let forward= self.curr + self.next;
-        self.curr = self.next;
-        self.next = forward;
-        Some(self.curr)
-
+    /// Simulate HTTP provide failure 
+    pub fn kill_http(&mut self){
+        // Create new empty Arc to replace the existing one 
+        self.http = Arc::new(Provider::<Http>::try_from("http://invalid.url").unwrap());
     }
+
 }
 
-fn fibonacci() -> Fibonacci{
-    Fibonacci { curr: 0, next: 1 }
-}
-// ............................... Custom Iterator .......................................
+#[tokio::main]
 
-fn main (){
+async fn main()-> Result<()>{
+    let rpc_url = "https://eth.llamarpc.com"; 
+    let ws_url = "wss://eth.llamarpc.com";
 
-    let mut counter =Counter::new();
-    assert_eq!(counter.next(), Some(1));
-    assert_eq!(counter.next(), Some(2));
-    assert_eq!(counter.next(), Some(3));
-    assert_eq!(counter.next(), Some(4));
-    assert_eq!(counter.next(), Some(5));
-    assert_eq!(counter.next(), None);
+    let mut client = EthClient::new(rpc_url, ws_url).await?;
+    println!("Current block: {}", client.get_block().await?);
     
-    let mut fib = fibonacci();
-    assert_eq!(fib.next(), Some(1));
-    assert_eq!(fib.next(), Some(1));
-    assert_eq!(fib.next(), Some(2));
-    assert_eq!(fib.next(), Some(3));
-    assert_eq!(fib.next(), Some(5));
+    // Simulate HTTP failure
+    println!("Simulate HTTP failure...");
+    // client.kill_http();
+    // This will cause a real timeout
+    std::thread::sleep(std::time::Duration::from_secs(10));
 
+    println!("Fallback block: {}", client.get_block().await?);
 
-    let v= vec![1,2,3];
-    for i in v {
-        println!("{}", i); // is similar to x in v.into_iter(){
-    }
-
-    let arr = [0;10];
-    for i in 0..arr.len(){
-        println!("{}", arr[i]);
-    }
-
-    let mut v = Vec::new();
-    for n in 0..100{
-        v.push(n);
-    }
-    assert_eq!(v.len(), 100);
-
-    let mut v1= vec![1,2,3].into_iter();
-    assert_eq!(v1.next(),Some(1));
-    assert_eq!(v1.next(),Some(2));
-    println!("v1:{:?}",v1);
-
-    let v2 = vec![1,2,3];
-    for i in v2.iter(){
-        println!("{}",i);
-    }
-    print!("{:?}",v2);
-
-    let mut names : Vec<&str>= vec!["Bob","Frank","Ferris"];
-    for name in names.iter_mut(){
-        *name =match name{
-            &mut "Ferris" =>"Ferris name has been changed to Fern.",
-            _=> "Hello",
-        }
-    }
-    println!("Names {:?}", names);
-
-    let mut values = vec![1,2,3];
-    let mut values_iter= values.iter_mut();
-    if let Some(v) =values_iter.next(){
-        *v = 0;
-    }
-    assert_eq!(values,vec![0,2,3]);
-  
-
-
+    Ok(())
 }
 
