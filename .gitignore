@@ -3,3 +3,10 @@
 .env
 note.md
 test.rs
+/src/bin/closures.rs
+/src/bin/generics.rs
+/src/bin/iterator.rs
+/src/bin/methods.rs
+/src/bin/results.rs
+/src/bin/traits.rs
+/src/bin/var_to_match.rs
