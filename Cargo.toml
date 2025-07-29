@@ -5,14 +5,37 @@ edition = "2024"
 default-run = "Rust_Marathon"
 
 [dependencies]
-# In Cargo.toml
+
+# Core Ethereum dependencies
+ethers = { version = "2.0",features = [   
+    "rustls",
+    "ws",
+
+    "etherscan",
+] }
+anyhow = "1.0" # Error handling
+tokio = { version = "1.0", features = ["full", "rt-multi-thread"] } # Async runtime
+futures = "0.3" # Stream utilities
+
+# Utility crates
+url = "2.0" # URL handling
+serde = { version = "1.0", features = ["derive"] } # Serialization
+serde_json = "1.0" # JSON handling
+thiserror = "1.0" # Custom error types
+
+# Development dependencies
+[dev-dependencies]
+dotenv = "0.15" # Environment variables
+
+
+# # In Cargo.toml
 primitive-types = {version="0.12", features = ["serde"]}
-ethers = {version= "2.0", features = ["ws","rustls"]} #Includes Websocket support
-dotenv = "0.15"
+# ethers = {version= "2.0", features = ["ws","rustls"]} #Includes Websocket support
+# dotenv = "0.15"
 reqwest = { version = "0.11", features = ["json"] }
-tokio = { version = "1.0", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-anyhow = "1.0" # For advanced error handling
-url = "2.0"
-thiserror = "1.0"
+# tokio = { version = "1.0", features = ["full"] }
+# serde = { version = "1.0", features = ["derive"] }
+# serde_json = "1.0"
+# anyhow = "1.0" # For advanced error handling
+# url = "2.0"
+# thiserror = "1.0"
