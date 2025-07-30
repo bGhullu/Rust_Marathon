@@ -1,6 +1,14 @@
 use ethers::{ 
     providers::{Http, Middleware, Provider, Ws}, 
-    types:: {BlockNumber,Transaction, H160, U256}, 
+    types:: {
+        NameOrAddress,
+        BlockNumber, 
+        Transaction, 
+        TransactionReceipt,
+        TransactionRequest, 
+        H160, U256,
+        transaction::eip2718::TypedTransaction
+    }, 
     utils::format_units
 };
 use std::{
@@ -12,6 +20,7 @@ use std::{
 };
 use anyhow::{anyhow,Result, Context};
 use futures::StreamExt;
+use tokio::time::Duration;
 
 
 
@@ -196,6 +205,32 @@ impl EthClient{
         Ok(max_fee + max_priority)
     }
 
+    pub async fn simulate_tx_request(
+        &self,
+        tx_request: &TransactionRequest
+    ) -> Result<(bool, U256)>{
+        let typed_tx: TypedTransaction = tx_request.clone().into();
+        // let tx_hash = typed_tx.hash();
+         
+         let mock_tx = Transaction {
+            hash: typed_tx.sighash(),
+            nonce: typed_tx.nonce().cloned().unwrap_or_default(),
+            from: typed_tx.from().map(|f| *f).unwrap_or_default(),
+            to: typed_tx.to().and_then(|addr| match addr {
+                NameOrAddress::Address(a) => Some (*a),
+                NameOrAddress::Name(_) => None,
+            }),
+            value: typed_tx.value().cloned().unwrap_or_default(),
+            gas: typed_tx.gas().cloned().unwrap_or_default(),
+            gas_price: typed_tx.gas_price().map(|gp| gp.clone()),
+            input: typed_tx.data().cloned().unwrap_or_default(),
+            ..Default::default()
+         };
+
+         self.simulate_tx(&mock_tx).await  
+        
+    }
+
     pub async fn simulate_tx(
         &self,
         tx: &Transaction,
@@ -212,6 +247,7 @@ impl EthClient{
         Ok((success, U256::from(gas_used)))
     }
 
+
 }
 
 
@@ -222,10 +258,30 @@ async fn main()-> Result<()>{
     let ws_url = "wss://eth.llamarpc.com";
 
     let mut client = EthClient::new(rpc_url, ws_url).await?;
+
+ 
+
+    match client.get_optimal_gas_price().await{
+        Ok(gas_price)=> println!("Optimal gas price: {} Gwei", format_units(gas_price, "gwei")?),
+        Err(e)=> eprintln!("Error getting gas price: {}", e),
+    }
+
+    let sample_tx = TransactionRequest::new()
+        .to("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".parse::<H160>()?)
+        .value(100_000_000_000_000_000_u64);
+
+    let typed_tx: TypedTransaction = sample_tx.clone().into();
+
+    let  gas_estimate = client.http.estimate_gas(&typed_tx,None).await?;
+    let sample_tx = sample_tx
+        .gas(gas_estimate)
+        .gas_price(client.get_optimal_gas_price().await?);
+    let (success,gas) = client.simulate_tx_request(&sample_tx).await?;
+    println!("Simulation result: success = {}, gas = {}", success, gas);
     println!("Current block: {}", client.get_block().await?);
     
     // Simulate HTTP failure
-    println!("Simulate HTTP failure...");
+    // println!("Simulate HTTP failure...");
     // client.kill_http();
    
     // std::thread::sleep(std::time::Duration::from_secs(10));
@@ -238,12 +294,20 @@ async fn main()-> Result<()>{
     tokio::spawn(async move {
         client_clone.stream_blocks().await.unwrap();
     });
-    client.stream_pending_txs().await?;
-
-    match client.get_optimal_gas_price().await{
-        Ok(gas_price)=> println!("Optimal gas price: {} Gwei", format_units(gas_price, "gwei")?),
-        Err(e)=> eprintln!("Error getting gas price: {}", e),
+    
+    loop {
+        match client.stream_pending_txs().await {
+            Ok(_) => break,
+            Err(e) => {
+                eprintln!("Stream failed, restarting: {}", e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
+    
+    // client.stream_pending_txs().await?;
+
+
 
     Ok(())
 }
