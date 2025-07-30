@@ -1,10 +1,13 @@
 use ethers::{
-    types:: Transaction,
+    types:: {Transaction, H160, U256},
     providers::{Http, Middleware, Provider, Ws}
 };
-use std::sync::{
+use std::{
+    collections::HashMap,
+    sync::{
     atomic::{AtomicBool, Ordering},
     Arc
+    }
 };
 use anyhow::{Result, Context};
 use futures::StreamExt;
@@ -18,6 +21,26 @@ struct EthClient{
     ws: Arc<Provider<Ws>>,
     current_block: u64,
     http_alive: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+enum MevOpportunity{
+    Sandwich{
+        frontrun_tx: Transaction,
+        victim_tx: Transaction,
+        backrun_tx: Transaction,
+        profit_estimate: U256,
+    },
+    Arbitrage{
+        path: Vec<H160>, // Pool address
+        profit: U256,
+    },
+    Liquidation{
+        liquidator: H160,
+        debt_position: H160,
+        profit: U256,
+    }
+
 }
 
 impl EthClient{
@@ -127,8 +150,37 @@ impl EthClient{
             }
             Ok(())    
     }
-    
+
+    pub async fn detect_mev(&self) -> Result<Vec<MevOpportunity>>{
+        let mut opportunities = Vec::new();
+        let mut pending_txs = HashMap::new();
+
+        let mut stream= self.ws.subscribe_pending_txs().await?;
+        while let Some(tx_hash) = stream.next().await{
+            if let Ok(Some(tx)) = self.get_transaction(tx_hash).await{
+                //1. Detect sandwich attacks
+                if let Some(opp) = self.detect_sandwich(&tx, &pending_txs).await
+                {
+                    opportunities.push(opp);
+                }
+                // 2. Track transactions in mempool
+            pending_txs.insert(tx.hash,tx);
+            }
+        }
+        Ok(opportunities)
+
+    }
+
+    async fn detect_sandwich(
+        &self,
+        new_tx: &Transaction,
+        mempool: &HashMap<ethers::types::TxHash, Transaction>
+    ) -> Option<MevOpportunity>{
+        //Implement sandwich detecion logic
+        None // Placeholder
+    }
 }
+
 
 #[tokio::main]
 
