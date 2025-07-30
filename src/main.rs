@@ -1,6 +1,7 @@
-use ethers::{
-    types:: {Transaction, H160, U256},
-    providers::{Http, Middleware, Provider, Ws}
+use ethers::{ 
+    providers::{Http, Middleware, Provider, Ws}, 
+    types:: {BlockNumber,Transaction, H160, U256}, 
+    utils::format_units
 };
 use std::{
     collections::HashMap,
@@ -9,7 +10,7 @@ use std::{
     Arc
     }
 };
-use anyhow::{Result, Context};
+use anyhow::{anyhow,Result, Context};
 use futures::StreamExt;
 
 
@@ -179,6 +180,38 @@ impl EthClient{
         //Implement sandwich detecion logic
         None // Placeholder
     }
+
+    pub async fn get_optimal_gas_price(&self) -> Result<U256> {
+        let fee_history = self.ws.fee_history(5,BlockNumber::Latest,&[50.0])
+            .await
+            .context("Failed to get fee history")?;
+        let base_fee = *fee_history.base_fee_per_gas.first()
+            .ok_or_else(|| anyhow::anyhow!("No base fee!"))?;
+        let max_priority = U256::from(2_000_000_000); //2 Gwei tip
+        let max_fee = base_fee
+            .checked_mul(U256::from(125))
+            .and_then(|v| v.checked_div(U256::from(100)))
+            .ok_or_else( || anyhow!("Gas price calculation overflow"))?;//25% over base
+
+        Ok(max_fee + max_priority)
+    }
+
+    pub async fn simulate_tx(
+        &self,
+        tx: &Transaction,
+    ) -> Result<(bool, U256)> {
+        let result = self.ws.call(&tx.into(), None).await?;
+        let receipt = self.ws.get_transaction_receipt(tx.hash)
+            .await?
+            .ok_or_else(|| anyhow!("Transaction receipt not found!"))?;
+
+    
+        let gas_used = receipt.gas_used
+            .ok_or_else(|| anyhow!("No gas used not available"))?;
+        let success = !result.is_empty();
+        Ok((success, U256::from(gas_used)))
+    }
+
 }
 
 
@@ -206,6 +239,11 @@ async fn main()-> Result<()>{
         client_clone.stream_blocks().await.unwrap();
     });
     client.stream_pending_txs().await?;
+
+    match client.get_optimal_gas_price().await{
+        Ok(gas_price)=> println!("Optimal gas price: {} Gwei", format_units(gas_price, "gwei")?),
+        Err(e)=> eprintln!("Error getting gas price: {}", e),
+    }
 
     Ok(())
 }
