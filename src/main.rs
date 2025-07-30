@@ -181,15 +181,6 @@ impl EthClient{
 
     }
 
-    async fn detect_sandwich(
-        &self,
-        new_tx: &Transaction,
-        mempool: &HashMap<ethers::types::TxHash, Transaction>
-    ) -> Option<MevOpportunity>{
-        //Implement sandwich detecion logic
-        None // Placeholder
-    }
-
     pub async fn get_optimal_gas_price(&self) -> Result<U256> {
         let fee_history = self.ws.fee_history(5,BlockNumber::Latest,&[50.0])
             .await
