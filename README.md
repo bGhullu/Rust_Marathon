@@ -52,7 +52,6 @@ A high-performance Ethereum client specializing in MEV opportunity detection wit
 
 ## 🌐 System Architecture
 
-```mermaid
 graph TD
     A[Ethereum Node] -->|JSON-RPC| B[EthClient]
     B --> C[MEV Detector Engine]
