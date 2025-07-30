@@ -52,6 +52,7 @@ A high-performance Ethereum client specializing in MEV opportunity detection wit
 
 ## 🌐 System Architecture
 
+```markdown
 graph TD
     A[Ethereum Node] -->|JSON-RPC| B[EthClient]
     B --> C[MEV Detector Engine]
@@ -73,8 +74,7 @@ graph TD
 3. **Visual Metrics**: Pie chart shows performance characteristics
 4. **GitHub Compatible**: Renders natively in GitHub/GitLab Markdown
 
-### Alternate Text-Only Version
-If you prefer no diagrams, replace the Mermaid sections with:
+
 
 ```markdown
 ## Text Architecture Overview
