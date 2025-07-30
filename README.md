@@ -75,8 +75,6 @@ graph TD
 4. **GitHub Compatible**: Renders natively in GitHub/GitLab Markdown
 
 
-
-```markdown
 ## Text Architecture Overview
 
 1. Ethereum Node (JSON-RPC)
