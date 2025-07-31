@@ -1,3 +1,10 @@
+mod contracts;
+use contracts::{
+    UNISWAP_V3_FACTORY, UNISWAP_V3_ROUTER, SUSHI_FACTORY, SUSHI_ROUTER, AAVE_LENDING_POOL,
+    WETH, USDC,
+    IUniswapV2Router02, IUniswapV3Pool, IUniswapV3Factory, IUniswapV2Factory, IUniswapV2Pair, ISushiRouter
+};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use ethers::{
@@ -18,8 +25,9 @@ use tokio::{
     sync::{Mutex, RwLock},
     time::{sleep, Instant},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use dotenv::dotenv;
+use ethers::types::transaction::eip2718::TypedTransaction;
 
 // Type aliases
 type PoolAddress = Address;
@@ -27,77 +35,6 @@ type TokenAddress = Address;
 type GasCost = U256;
 
 
-// Constants
-static UNISWAP_V3_FACTORY: Lazy<Address> = Lazy::new(|| {
-    "0x1F98431c8aD98523631AE4a59f267346ea31F984"
-        .parse()
-        .unwrap()
-});
-static UNISWAP_V3_ROUTER: Lazy<Address> = Lazy::new(|| {
-    "0xE592427A0AEce92De3Edee1F18E0157C05861564"
-        .parse()
-        .unwrap()
-});
-static SUSHI_FACTORY: Lazy<Address> = Lazy::new(|| {
-    "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac"
-        .parse()
-        .unwrap()
-});
-static SUSHI_ROUTER: Lazy<Address> = Lazy::new(|| {
-    "0xd9e1cE17f6638c9A13a9a05dE046D742f52C256b"
-        .parse()
-        .unwrap()
-});
-static AAVE_LENDING_POOL: Lazy<Address> = Lazy::new(|| {
-    "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"
-        .parse()
-        .unwrap()
-});
-
-// Generate contract bindings
-abigen!(
-    IUniswapV2Router02,
-    r#"[
-        function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)
-    ]"#
-);
-
-abigen!(
-    IUniswapV3Pool,
-    r#"[
-        function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)
-        function liquidity() external view returns (uint128)
-    ]"#
-);
-
-abigen!(
-    IUniswapV3Factory,
-    r#"[
-        function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool)
-    ]"#
-);
-
-abigen!(
-    IUniswapV2Factory,
-    r#"[
-        function getPair(address tokenA, address tokenB) external view returns (address pair)
-    ]"#
-);
-
-abigen!(
-    IUniswapV2Pair,
-    r#"[
-        function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)
-    ]"#
-);
-
-abigen!(
-    ISushiRouter,
-    r#"[
-        function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)
-        function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)
-    ]"#
-);
 
 // Config
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +126,46 @@ pub struct CircuitBreaker {
     pub is_active: Arc<RwLock<bool>>,
 }
 
+impl CircuitBreaker {
+    pub async fn should_halt_trading(&self) -> bool {
+        let metrics = self.current_metrics.read().await;
+        let is_active = *self.is_active.read().await;
+        
+        !is_active || 
+        metrics.daily_pnl < -self.max_daily_loss ||
+        metrics.concurrent_trades >= self.max_concurrent_trades
+    }
+
+    pub async fn record_trade(&self, profit: f64, volume: U256) {
+        let mut metrics = self.current_metrics.write().await;
+        metrics.total_trades += 1;
+        metrics.daily_pnl += profit;
+        metrics.weekly_pnl += profit;
+        metrics.total_volume += volume;
+        
+        if profit > 0.0 {
+            metrics.successful_trades += 1;
+        } else {
+            metrics.failed_trades += 1;
+        }
+    }
+
+    pub async fn pause(&self) {
+        *self.is_active.write().await = false;
+        info!("Circuit breaker: Trading paused");
+    }
+
+    pub async fn resume(&self) {
+        *self.is_active.write().await = true;
+        info!("Circuit breaker: Trading resumed");
+    }
+
+    pub async fn emergency_stop(&self) {
+        *self.is_active.write().await = false;
+        error!("EMERGENCY STOP ACTIVATED");
+    }
+}
+
 #[derive(Debug)]
 pub struct TradingMetrics {
     pub daily_pnl: f64,
@@ -197,7 +174,7 @@ pub struct TradingMetrics {
     pub successful_trades: u64,
     pub failed_trades: u64,
     pub total_volume: U256,
-    pub last_reset: u64, // Unix timestamp
+    pub last_reset: u64,
     pub concurrent_trades: usize,
 }
 
@@ -217,14 +194,6 @@ impl Default for TradingMetrics {
             concurrent_trades: 0,
         }
     }
-}
-
-pub struct PriceOracle {
-    providers: HashMap<DexType, Arc<Provider<Ws>>>,
-    price_cache: Arc<RwLock<HashMap<(TokenAddress, TokenAddress), PriceDataPoint>>>,
-    stablecoin_oracle: Arc<dyn StablecoinOracle + Send + Sync>,
-    validator: Arc<PriceValidator>,
-    config: Arc<BotConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -269,22 +238,37 @@ impl ArbitrageChecker {
     }
 
     async fn get_uniswap_price(&self, token_in: TokenAddress, token_out: TokenAddress) -> Result<f64> {
-        let router = IUniswapV2Router02::new(self.uniswap_router, Arc::new(self.client.as_ref().clone()));
+        let router = IUniswapV2Router02::new(self.uniswap_router, Arc::new(self.client.clone()));
         let path = vec![token_in, token_out];
         let amounts = router.get_amounts_out(U256::from(10).pow(18.into()), path).call().await?;
         Ok(amounts[1].as_u128() as f64 / 1e18)
     }
 
     async fn get_sushi_price(&self, token_in: TokenAddress, token_out: TokenAddress) -> Result<f64> {
-        let router = ISushiRouter::new(self.sushi_router, Arc::new(self.client.as_ref().clone()));
+        let router = ISushiRouter::new(self.sushi_router, Arc::new(self.client.clone()));
         let path = vec![token_in, token_out];
         let amounts = router.get_amounts_out(U256::from(10).pow(18.into()), path).call().await?;
         Ok(amounts[1].as_u128() as f64 / 1e18)
     }
 }
 
+pub struct PriceOracle {
+    providers: HashMap<DexType, Arc<Provider<Ws>>>,
+    price_cache: Arc<RwLock<HashMap<(TokenAddress, TokenAddress), PriceDataPoint>>>,
+    stablecoin_oracle: Arc<dyn StablecoinOracle + Send + Sync>,
+    validator: Arc<PriceValidator>,
+    config: Arc<BotConfig>,
+}
+
 impl PriceOracle {
     pub async fn get_real_price(&self, token_in: TokenAddress, token_out: TokenAddress) -> Result<f64> {
+        // Check cache first
+        if let Some(cached) = self.price_cache.read().await.get(&(token_in, token_out)) {
+            if cached.timestamp.elapsed() < Duration::from_secs(5) {
+                return Ok(cached.price);
+            }
+        }
+
         let mut prices = Vec::new();
         let mut liquidities = Vec::new();
 
@@ -313,13 +297,29 @@ impl PriceOracle {
         }
 
         let total_liquidity: U256 = liquidities.iter().fold(U256::zero(), |acc, x| acc + *x);
-        if total_liquidity.is_zero() {
-            return Ok(prices.iter().sum::<f64>() / prices.len() as f64);
-        }
+        let weighted_price = if total_liquidity.is_zero() {
+            prices.iter().sum::<f64>() / prices.len() as f64
+        } else {
+            prices.iter().zip(liquidities.iter())
+                .map(|(p, l)| p * l.as_u128() as f64)
+                .sum::<f64>() / total_liquidity.as_u128() as f64
+        };
 
-        let weighted_price = prices.iter().zip(liquidities.iter())
-            .map(|(p, l)| p * l.as_u128() as f64)
-            .sum::<f64>() / total_liquidity.as_u128() as f64;
+        // Update cache
+        let mut cache = self.price_cache.write().await;
+        cache.insert(
+            (token_in, token_out),
+            PriceDataPoint {
+                price: weighted_price,
+                timestamp: Instant::now(),
+                block_number: self.providers[&DexType::UniswapV3]
+                    .get_block_number()
+                    .await?
+                    .as_u64(),
+                sources: prices.len(),
+                liquidity: total_liquidity,
+            },
+        );
 
         Ok(weighted_price)
     }
@@ -356,6 +356,13 @@ impl PriceOracle {
     }
 }
 
+pub struct MevProtection {
+    pub max_priority_fee_per_gas: U256,
+    pub min_priority_fee_per_gas: U256,
+    pub flashbots_enabled: bool,
+    pub private_rpc_url: Option<String>,
+}
+
 pub struct ArbitrageEngine {
     oracle: Arc<PriceOracle>,
     circuit_breaker: Arc<CircuitBreaker>,
@@ -365,13 +372,6 @@ pub struct ArbitrageEngine {
     opportunity_queue: Arc<Mutex<VecDeque<ArbitrageOpportunity>>>,
     historical_opportunities: Arc<RwLock<Vec<ArbitrageOpportunity>>>,
     mev_protection: Arc<MevProtection>,
-}
-
-pub struct MevProtection {
-    pub max_priority_fee_per_gas: U256,
-    pub min_priority_fee_per_gas: U256,
-    pub flashbots_enabled: bool,
-    pub private_rpc_url: Option<String>,
 }
 
 impl ArbitrageEngine {
@@ -525,7 +525,7 @@ impl ArbitrageEngine {
 
     async fn simulate_swap(
         &self,
-        _pool: PoolAddress,
+        pool: PoolAddress,
         token_in: TokenAddress,
         amount_in: U256,
         dex: DexType,
@@ -533,13 +533,13 @@ impl ArbitrageEngine {
         match dex {
             DexType::UniswapV3 => {
                 let quoter = IUniswapV2Router02::new(*UNISWAP_V3_ROUTER, self.trade_executor.client.clone());
-                let path = vec![token_in, token_in]; // This should be properly implemented with actual token pairs
+                let path = vec![token_in, token_in]; // Simplified for example
                 let amounts = quoter.get_amounts_out(amount_in, path).call().await?;
                 Ok((amounts[1], U256::from(100_000)))
             }
             DexType::SushiSwap => {
                 let router = ISushiRouter::new(*SUSHI_ROUTER, self.trade_executor.client.clone());
-                let path = vec![token_in, token_in]; // This should be properly implemented with actual token pairs
+                let path = vec![token_in, token_in]; // Simplified for example
                 let amounts = router.get_amounts_out(amount_in, path).call().await?;
                 Ok((amounts[1], U256::from(120_000)))
             }
@@ -584,15 +584,15 @@ impl ArbitrageEngine {
 pub trait FlashLoanProvider: Send + Sync {
     fn execute_flash_loan(
         &self,
-        _amount: U256,
-        _token: TokenAddress,
-        _pools: Vec<PoolAddress>,
+        amount: U256,
+        token: TokenAddress,
+        pools: Vec<PoolAddress>,
     ) -> BoxFuture<'_, Result<TxHash>>;
     
     fn estimate_flash_loan_fee(
         &self,
         amount: U256,
-        _token: TokenAddress,
+        token: TokenAddress,
     ) -> BoxFuture<'_, Result<U256>>;
 }
 
@@ -605,14 +605,14 @@ pub struct AaveFlashLoanProvider {
 impl FlashLoanProvider for AaveFlashLoanProvider {
     fn execute_flash_loan(
         &self,
-        _amount: U256,
-        _token: TokenAddress,
-        _pools: Vec<PoolAddress>,
+        amount: U256,
+        token: TokenAddress,
+        pools: Vec<PoolAddress>,
     ) -> BoxFuture<'_, Result<TxHash>> {
         Box::pin(async move {
             let tx = TransactionRequest::new()
                 .to(self.lending_pool)
-                .data(vec![]);
+                .data(vec![]); // Simplified for example
             let pending_tx = self.client.send_transaction(tx, None).await?;
             Ok(pending_tx.tx_hash())
         })
@@ -624,14 +624,14 @@ impl FlashLoanProvider for AaveFlashLoanProvider {
         _token: TokenAddress,
     ) -> BoxFuture<'_, Result<U256>> {
         Box::pin(async move {
-            Ok(amount * U256::from(9) / U256::from(10000))
+            Ok(amount * U256::from(9) / U256::from(10000)) // 0.09% fee
         })
     }
 }
 
 pub struct TradeExecutor {
     client: Arc<Provider<Http>>,
-    flash_loan_providers: Vec<Arc<AaveFlashLoanProvider>>,
+    flash_loan_providers: Vec<Arc<dyn FlashLoanProvider + Send + Sync>>,
     config: Arc<BotConfig>,
     pending_txs: Arc<Mutex<HashMap<TxHash, Instant>>>,
     mev_protection: Arc<MevProtection>,
@@ -671,7 +671,7 @@ impl TradeExecutor {
     }
 
     pub async fn execute(&self, opportunity: ArbitrageOpportunity) -> Result<TxHash> {
-        let _flash_loan_tx = self.flash_loan_providers[0]
+        let flash_loan_tx = self.flash_loan_providers[0]
             .execute_flash_loan(
                 opportunity.optimal_amount,
                 opportunity.token_path[0].address,
@@ -681,26 +681,9 @@ impl TradeExecutor {
 
         let tx = TransactionRequest::new()
             .to(*AAVE_LENDING_POOL)
-            .data(vec![]);
+            .data(vec![]); // Simplified for example
 
         self.execute_with_mev_protection(tx, &self.mev_protection).await
-    }
-}
-
-pub struct HealthCheck {
-    last_heartbeat: Arc<RwLock<Instant>>,
-    max_latency: Duration,
-}
-
-impl HealthCheck {
-    pub async fn check(&self) -> Result<()> {
-        let now = Instant::now();
-        let last = *self.last_heartbeat.read().await;
-        if now.duration_since(last) > self.max_latency {
-            Err(anyhow::anyhow!("Health check failed - latency too high"))
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -709,6 +692,72 @@ pub struct SimulationResult {
     pub actual_profit: f64,
     pub gas_used: U256,
     pub revert_reason: Option<String>,
+}
+
+pub struct HealthCheck {
+    last_heartbeat: Arc<RwLock<Instant>>,
+    max_latency: Duration,
+    heartbeat_interval: Duration,
+    component_status: Arc<RwLock<HashMap<String, bool>>>,
+}
+
+impl HealthCheck {
+    pub fn new(max_latency: Duration) -> Self {
+        Self {
+            last_heartbeat: Arc::new(RwLock::new(Instant::now())),
+            max_latency,
+            heartbeat_interval: max_latency / 2,
+            component_status: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn update_heartbeat(&self) {
+        *self.last_heartbeat.write().await = Instant::now();
+    }
+
+    pub async fn check(&self) -> Result<()> {
+        let now = Instant::now();
+        let last = *self.last_heartbeat.read().await;
+        
+        if now.duration_since(last) > self.max_latency {
+            return Err(anyhow::anyhow!("Health check failed - latency too high"));
+        }
+
+        let components = self.component_status.read().await;
+        for (name, healthy) in components.iter() {
+            if !healthy {
+                return Err(anyhow::anyhow!("Component {} is unhealthy", name));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn update_component_status(&self, name: &str, healthy: bool) {
+        let mut components = self.component_status.write().await;
+        components.insert(name.to_string(), healthy);
+    }
+
+    pub async fn run_heartbeat_updater(&self) {
+        let heartbeat = self.last_heartbeat.clone();
+        let interval = self.heartbeat_interval;
+        
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                *heartbeat.write().await = Instant::now();
+            }
+        });
+    }
+}
+
+struct MockStablecoinOracle;
+
+#[async_trait]
+impl StablecoinOracle for MockStablecoinOracle {
+    fn get_price(&self, _token: TokenAddress) -> BoxFuture<'_, Result<f64>> {
+        Box::pin(async move { Ok(1.0) })
+    }
 }
 
 pub struct ArbitrageBot {
@@ -720,6 +769,10 @@ pub struct ArbitrageBot {
 
 impl ArbitrageBot {
     pub async fn run(&self) -> Result<()> {
+        // Start the heartbeat updater
+        self.health_check.run_heartbeat_updater().await;
+
+        // Run all components
         let finder = self.find_opportunities();
         let executor = self.execute_opportunities();
         let health = self.monitor_health();
@@ -730,6 +783,12 @@ impl ArbitrageBot {
 
     async fn find_opportunities(&self) -> Result<()> {
         loop {
+            if self.engine.circuit_breaker.should_halt_trading().await {
+                warn!("Circuit breaker active - pausing opportunity search");
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
             match self.engine.find_multi_hop_arbitrage(3).await {
                 Ok(opportunities) => {
                     for opp in opportunities {
@@ -746,14 +805,26 @@ impl ArbitrageBot {
 
     async fn execute_opportunities(&self) -> Result<()> {
         loop {
+            if self.engine.circuit_breaker.should_halt_trading().await {
+                warn!("Circuit breaker active - pausing execution");
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
             let opportunity = {
                 let mut queue = self.engine.opportunity_queue.lock().await;
                 queue.pop_front()
             };
 
             if let Some(opp) = opportunity {
-                match self.executor.execute(opp).await {
-                    Ok(tx_hash) => info!("Executed arbitrage: {:?}", tx_hash),
+                match self.executor.execute(opp.clone()).await {
+                    Ok(tx_hash) => {
+                        info!("Executed arbitrage: {:?}", tx_hash);
+                        self.engine.circuit_breaker.record_trade(
+                            opp.net_profit,
+                            opp.optimal_amount,
+                        ).await;
+                    }
                     Err(e) => error!("Execution failed: {}", e),
                 }
             }
@@ -762,30 +833,143 @@ impl ArbitrageBot {
     }
 
     async fn monitor_health(&self) -> Result<()> {
+        // Monitor individual components
+        let components = vec!["oracle", "executor", "engine"];
+        let check_intervals = Duration::from_secs(3);
+
         loop {
+            // Update component statuses
+            self.health_check.update_component_status(
+                "oracle", 
+                self.check_oracle_health().await.is_ok()
+            ).await;
+            
+            self.health_check.update_component_status(
+                "executor",
+                self.check_executor_health().await.is_ok()
+            ).await;
+
+            self.health_check.update_component_status(
+                "engine",
+                self.check_engine_health().await.is_ok()
+            ).await;
+
+            // Perform overall health check
             if let Err(e) = self.health_check.check().await {
                 error!("Health check failed: {}", e);
+                self.handle_health_failure(e).await;
             }
-            sleep(Duration::from_secs(5)).await;
+
+            sleep(check_intervals).await;
         }
     }
-}
 
-struct MockStablecoinOracle;
+    async fn check_oracle_health(&self) -> Result<()> {
+        let test_token = Address::zero(); // Replace with actual token address
+        match self.engine.oracle.get_real_price(test_token, test_token).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("Oracle health check failed: {}", e)),
+        }
+    }
 
-#[async_trait]
-impl StablecoinOracle for MockStablecoinOracle {
-    fn get_price(&self, _token: TokenAddress) -> BoxFuture<'_, Result<f64>> {
-        Box::pin(async move { Ok(1.0) })
+    async fn check_executor_health(&self) -> Result<()> {
+        match self.executor.client.estimate_gas(
+            &TypedTransaction::Legacy(TransactionRequest::new()),
+            None
+        ).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("Executor health check failed: {}", e)),
+        }
+    }
+
+    async fn check_engine_health(&self) -> Result<()> {
+        match self.engine.find_multi_hop_arbitrage(1).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("Engine health check failed: {}", e)),
+        }
+    }
+
+    async fn handle_health_failure(&self, error: anyhow::Error) {
+        error!("Handling health failure: {}", error);
+        
+        // 1. Pause trading through circuit breaker
+        self.engine.circuit_breaker.pause().await;
+        
+        // 2. Attempt to reconnect providers
+        if let Err(e) = self.reconnect_providers().await {
+            error!("Failed to reconnect providers: {}", e);
+        }
+        
+        // 3. Reset health status after recovery attempts
+        self.health_check.update_heartbeat().await;
+        self.engine.circuit_breaker.resume().await;
+    }
+
+    async fn reconnect_providers(&self) -> Result<()> {
+        info!("Attempting to reconnect providers...");
+        // Implementation would depend on your provider setup
+        Ok(())
     }
 }
 
-// Example usage and main function
+fn create_sample_pools() -> Vec<PoolInfo> {
+    vec![
+        PoolInfo {
+            address: "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640".parse().unwrap(),
+            dex: DexType::UniswapV3,
+            token0: TokenInfo {
+                address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap(),
+                symbol: "USDC".to_string(),
+                decimals: 6,
+                is_stable: true,
+                price_usd: Some(1.0),
+                volatility: 0.01,
+            },
+            token1: TokenInfo {
+                address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".parse().unwrap(),
+                symbol: "WETH".to_string(),
+                decimals: 18,
+                is_stable: false,
+                price_usd: Some(3000.0),
+                volatility: 0.05,
+            },
+            fee: 500,
+            tick_spacing: 10,
+            last_updated: Instant::now(),
+            historical_volume: 1000000.0,
+        },
+        PoolInfo {
+            address: "0x06da0fd433C1A5d7a4faa01111c044910A184553".parse().unwrap(),
+            dex: DexType::SushiSwap,
+            token0: TokenInfo {
+                address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap(),
+                symbol: "USDC".to_string(),
+                decimals: 6,
+                is_stable: true,
+                price_usd: Some(1.0),
+                volatility: 0.01,
+            },
+            token1: TokenInfo {
+                address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".parse().unwrap(),
+                symbol: "WETH".to_string(),
+                decimals: 18,
+                is_stable: false,
+                price_usd: Some(3000.0),
+                volatility: 0.05,
+            },
+            fee: 300,
+            tick_spacing: 1,
+            last_updated: Instant::now(),
+            historical_volume: 500000.0,
+        },
+    ]
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
     let infura_key = std::env::var("INFURA_KEY")
-         .expect("INFURA_KEY must be set in .env file");
+        .expect("INFURA_KEY must be set in .env file");
     tracing_subscriber::fmt::init();
 
     // Initialize configuration
@@ -802,11 +986,14 @@ async fn main() -> Result<()> {
         profit_estimation_buffer: 0.1,
     });
 
-    // Set up providers - Use your actual RPC endpoints
-    let http_provider = Provider::<Http>::try_from(format!("https://mainnet.infura.io/v3/{}", infura_key))
-        .map_err(|e| anyhow::anyhow!("Failed to create HTTP provider: {}", e))?;
-    let ws_provider = Provider::<Ws>::connect(format!("wss://mainnet.infura.io/ws/v3/{}", infura_key)).await
-        .map_err(|e| anyhow::anyhow!("Failed to create ws provider: {}", e))?;
+    // Set up providers
+    let http_url = format!("https://mainnet.infura.io/v3/{}", infura_key);
+    let http_provider = Provider::<Http>::try_from(http_url)
+        .map_err(|e| anyhow::anyhow!("HTTP provider error: {}", e))?;
+
+    let ws_url = format!("wss://mainnet.infura.io/ws/v3/{}", infura_key);
+    let ws_provider = Provider::<Ws>::connect(&ws_url).await
+        .map_err(|e| anyhow::anyhow!("WebSocket connection failed: {}", e))?;
 
     // Set up components
     let stablecoin_oracle = Arc::new(MockStablecoinOracle);
@@ -863,7 +1050,7 @@ async fn main() -> Result<()> {
     let engine = Arc::new(ArbitrageEngine {
         oracle,
         circuit_breaker,
-        pools: create_sample_pools(), // You'll need to implement this
+        pools: create_sample_pools(),
         config: config.clone(),
         trade_executor: trade_executor.clone(),
         opportunity_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -871,10 +1058,7 @@ async fn main() -> Result<()> {
         mev_protection,
     });
 
-    let health_check = Arc::new(HealthCheck {
-        last_heartbeat: Arc::new(RwLock::new(Instant::now())),
-        max_latency: Duration::from_secs(10),
-    });
+    let health_check = Arc::new(HealthCheck::new(Duration::from_secs(10)));
 
     let bot = ArbitrageBot {
         engine,
@@ -883,104 +1067,12 @@ async fn main() -> Result<()> {
         health_check,
     };
 
-    // Run the bot
+    // Run the bot with error handling
     println!("Starting arbitrage bot...");
-    bot.run().await
-}
-
-// Helper function to create sample pools - you'll need to implement this properly
-fn create_sample_pools() -> Vec<PoolInfo> {
-    // This is a placeholder - you'll need to populate this with real pool data
-    // from the blockchain or a data provider
-    vec![]
-}
-
-// Additional utility functions
-
-impl BotConfig {
-    pub fn new_conservative() -> Self {
-        Self {
-            max_trade_size: U256::from(10).pow(17.into()), // 0.1 ETH
-            min_profit_threshold: 0.5, // 0.5% minimum profit
-            max_slippage: 0.3,
-            max_price_impact: 0.5,
-            gas_price_multiplier: 1.1,
-            max_concurrent_trades: 2,
-            max_trade_retries: 2,
-            max_tx_wait_time: Duration::from_secs(20),
-            flash_loan_fee: 0.0009,
-            profit_estimation_buffer: 0.2,
-        }
-    }
-
-    pub fn new_aggressive() -> Self {
-        Self {
-            max_trade_size: U256::from(10).pow(19.into()), // 10 ETH
-            min_profit_threshold: 0.05, // 0.05% minimum profit
-            max_slippage: 1.0,
-            max_price_impact: 2.0,
-            gas_price_multiplier: 1.5,
-            max_concurrent_trades: 5,
-            max_trade_retries: 5,
-            max_tx_wait_time: Duration::from_secs(45),
-            flash_loan_fee: 0.0009,
-            profit_estimation_buffer: 0.05,
-        }
-    }
-}
-
-impl CircuitBreaker {
-    pub async fn should_halt_trading(&self) -> bool {
-        let metrics = self.current_metrics.read().await;
-        let is_active = *self.is_active.read().await;
-        
-        !is_active || 
-        metrics.daily_pnl < -self.max_daily_loss ||
-        metrics.concurrent_trades >= self.max_concurrent_trades
-    }
-
-    pub async fn record_trade(&self, profit: f64, volume: U256) {
-        let mut metrics = self.current_metrics.write().await;
-        metrics.total_trades += 1;
-        metrics.daily_pnl += profit;
-        metrics.weekly_pnl += profit;
-        metrics.total_volume += volume;
-        
-        if profit > 0.0 {
-            metrics.successful_trades += 1;
-        } else {
-            metrics.failed_trades += 1;
-        }
-    }
-}
-
-// Risk management utilities
-impl ArbitrageOpportunity {
-    pub fn calculate_risk_score(&self) -> f64 {
-        let mut risk = 0.0;
-        
-        // Add risk based on path length
-        risk += (self.path.len() as f64 - 1.0) * 0.1;
-        
-        // Add risk based on expected profit (lower profit = higher risk)
-        if self.expected_profit < 0.1 {
-            risk += 0.3;
-        }
-        
-        // Add risk based on gas cost relative to profit
-        let gas_cost_eth = self.total_gas_cost.as_u128() as f64 / 1e18;
-        if gas_cost_eth > self.expected_profit * 0.5 {
-            risk += 0.4;
-        }
-        
-        risk.min(1.0)
-    }
-    
-    pub fn is_profitable_after_fees(&self, gas_price: U256) -> bool {
-        let gas_cost_eth = (self.total_gas_cost * gas_price).as_u128() as f64 / 1e18;
-        let flash_loan_fee = self.optimal_amount.as_u128() as f64 * 0.0009 / 1e18;
-        let total_fees = gas_cost_eth + flash_loan_fee;
-        
-        self.expected_profit > total_fees
+    if let Err(e) = bot.run().await {
+        error!("Bot crashed: {}", e);
+        Err(e)
+    } else {
+        Ok(())
     }
 }
