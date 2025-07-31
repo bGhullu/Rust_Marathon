@@ -3,6 +3,7 @@
 .env
 note.md
 test.rs
+test1.rs
 /src/bin/closures.rs
 /src/bin/generics.rs
 /src/bin/iterator.rs

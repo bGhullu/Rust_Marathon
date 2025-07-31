@@ -1,575 +1,986 @@
-// ============================================================================
-// External crate imports: ethers-rs provides Ethereum JSON-RPC client capabilities.
-// ============================================================================
-
-// Ethers providers:
-// - Http: Standard REST-based JSON-RPC provider, typically synchronous requests,
-//   easier to use for stateless queries (e.g., fetching a block or tx by hash).
-// - Ws: WebSocket provider supporting subscriptions (eth_subscribe) for
-//   real-time event streaming, essential for mempool monitoring and block notifications.
-// - Middleware: Trait that abstracts provider behavior, enabling composability.
+use anyhow::Result;
+use async_trait::async_trait;
 use ethers::{
+    contract::abigen,
+    prelude::*,
     providers::{Http, Middleware, Provider, Ws},
-    types::{
-        // Ethereum address representation (20 bytes)
-        H160,
-        // 256-bit unsigned integers, the core numeric type for balances, gas, etc.
-        U256,
-        // A transaction hash (H256) alias, not imported here but used implicitly
-        NameOrAddress, // Tx 'to' field can be a raw address or ENS name, must handle both
-        BlockNumber, // Enum for specifying blocks in calls (Latest, Pending, Number, etc.)
-        Transaction, // Complete transaction data structure from Ethereum node
-        TransactionReceipt, // Receipt containing execution status and gas used
-        TransactionRequest, // Builder for transaction calls (simulate/send)
-        transaction::eip2718::TypedTransaction, // Unified tx format supporting legacy and EIP-1559 txs
-    },
-    utils::format_units, // Utility to convert wei to ETH/gwei/etc for human-readable output
+    types::{Address, TransactionRequest, U256},
 };
-
-// ============================================================================
-// Standard library imports:
-// ============================================================================
-
+use futures::future::BoxFuture;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap, // Used to track mempool txs for MEV detection (hash => tx)
-    sync::{
-        // AtomicBool: An atomic boolean flag supporting lock-free concurrent access.
-        // Chosen here for HTTP health tracking to avoid mutex overhead.
-        // Ordering::SeqCst guarantees a global total ordering for consistent visibility
-        // across threads — important for avoiding stale reads in async contexts.
-        atomic::{AtomicBool, Ordering},
-        // Arc (Atomic Reference Counted) pointer: allows multiple owners across async tasks.
-        // This is essential for sharing the HTTP/WS provider instances and status flags
-        // safely across concurrently running async functions without cloning heavy clients.
-        Arc,
-    },
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::{sleep, Instant},
+};
+use tracing::{error, info};
+use dotenv::dotenv;
 
-// ============================================================================
-// Error handling and async stream imports:
-// ============================================================================
+// Type aliases
+type PoolAddress = Address;
+type TokenAddress = Address;
+type GasCost = U256;
 
-// anyhow: Provides convenient, chainable error handling with context support.
-// Allows attaching messages to errors for easier debugging/tracing in async flows.
-use anyhow::{anyhow, Result, Context};
 
-// futures::StreamExt extends Stream trait with useful combinators (e.g., .next()).
-// Required for iterating over asynchronous WebSocket subscription streams.
-use futures::StreamExt;
+// Constants
+static UNISWAP_V3_FACTORY: Lazy<Address> = Lazy::new(|| {
+    "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+        .parse()
+        .unwrap()
+});
+static UNISWAP_V3_ROUTER: Lazy<Address> = Lazy::new(|| {
+    "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+        .parse()
+        .unwrap()
+});
+static SUSHI_FACTORY: Lazy<Address> = Lazy::new(|| {
+    "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac"
+        .parse()
+        .unwrap()
+});
+static SUSHI_ROUTER: Lazy<Address> = Lazy::new(|| {
+    "0xd9e1cE17f6638c9A13a9a05dE046D742f52C256b"
+        .parse()
+        .unwrap()
+});
+static AAVE_LENDING_POOL: Lazy<Address> = Lazy::new(|| {
+    "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"
+        .parse()
+        .unwrap()
+});
 
-// Tokio time utilities, provides async-aware delays.
-// Used here for retry delays on stream failures, backoff, or simulated failure.
-use tokio::time::Duration;
+// Generate contract bindings
+abigen!(
+    IUniswapV2Router02,
+    r#"[
+        function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)
+    ]"#
+);
 
-// ============================================================================
-// ETHCLIENT STRUCT DEFINITION WITH DEEP EXPLANATION:
-// ============================================================================
+abigen!(
+    IUniswapV3Pool,
+    r#"[
+        function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)
+        function liquidity() external view returns (uint128)
+    ]"#
+);
 
-/// `EthClient` encapsulates the core Ethereum JSON-RPC clients with
-/// redundant providers for fault tolerance, live mempool subscriptions,
-/// and transaction simulation facilities.
-///
-/// This struct is engineered for high-reliability, low-latency Ethereum interaction,
-/// a common need for MEV searchers, arbitrage bots, and monitoring agents.
-///
-/// # Concurrency and Safety
-///
-/// - All providers and health flags are wrapped in `Arc` to enable safe concurrent
-///   usage across async tasks without cloning heavy underlying clients.
-/// - The health flag `http_alive` is an `AtomicBool` with `SeqCst` ordering to ensure
-///   the strongest memory ordering guarantees, critical to prevent race conditions
-///   between health status reads/writes in async runtime.
-/// - The current block is a `u64` cache updated on each successful fetch; it is
-///   not atomic as updates happen within single-threaded async contexts.
-///
-/// # Provider Roles
-///
-/// - `http`: Used primarily for synchronous, one-off queries where WebSocket
-///   is either not supported or less performant.
-/// - `ws`: Used for subscriptions (block headers, pending txs) and as a failover
-///   in case HTTP queries fail or are out of sync.
-///
-/// # Failure Handling
-///
-/// The client actively monitors provider sync state and allows simulating failure
-/// (for testing) by replacing the HTTP provider with an invalid URL.
-/// 
-/// This failover strategy is essential because Ethereum nodes may become unresponsive,
-/// rate-limited, or desynchronized during network congestion or RPC provider issues.
-///
-/// # Typical Usage
-///
-/// 1. Initialize client with HTTP and WS URLs.
-/// 2. Use `get_block` for latest block height with fallback logic.
-/// 3. Stream blocks and mempool txs via WebSocket.
-/// 4. Detect MEV opportunities and simulate tx execution.
-///
-/// ```
-/// let client = EthClient::new(http_url, ws_url).await?;
-/// let block = client.get_block().await?;
-/// client.stream_pending_txs().await?;
-/// ```
-///
-#[derive(Clone)] // Required for safe passing of client handles to multiple async tasks
-struct EthClient {
-    /// Primary HTTP JSON-RPC provider for synchronous queries.
-    /// Uses Arc to allow cheap cloning and sharing between async tasks.
-    http: Arc<Provider<Http>>,
+abigen!(
+    IUniswapV3Factory,
+    r#"[
+        function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool)
+    ]"#
+);
 
-    /// WebSocket provider enabling real-time subscriptions.
-    /// Also serves as fallback when HTTP provider is unavailable.
-    ws: Arc<Provider<Ws>>,
+abigen!(
+    IUniswapV2Factory,
+    r#"[
+        function getPair(address tokenA, address tokenB) external view returns (address pair)
+    ]"#
+);
 
-    /// Tracks the latest known block number from successful fetches.
-    /// Updated on each call to `get_block` and used to verify provider sync.
-    current_block: u64,
+abigen!(
+    IUniswapV2Pair,
+    r#"[
+        function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)
+    ]"#
+);
 
-    /// Atomic health flag for the HTTP provider.
-    /// Ensures threads see the latest health state.
-    /// When false, forces fallback to WS provider exclusively.
-    http_alive: Arc<AtomicBool>,
+abigen!(
+    ISushiRouter,
+    r#"[
+        function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)
+        function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)
+    ]"#
+);
+
+// Config
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BotConfig {
+    pub max_trade_size: U256,
+    pub min_profit_threshold: f64,
+    pub max_slippage: f64,
+    pub max_price_impact: f64,
+    pub gas_price_multiplier: f64,
+    pub max_concurrent_trades: usize,
+    pub max_trade_retries: u32,
+    pub max_tx_wait_time: Duration,
+    pub flash_loan_fee: f64,
+    pub profit_estimation_buffer: f64,
 }
 
-// ============================================================================
-// MEV OPPORTUNITIES ENUM WITH IN-DEPTH COMMENTARY:
-// ============================================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenInfo {
+    pub address: TokenAddress,
+    pub symbol: String,
+    pub decimals: u8,
+    pub is_stable: bool,
+    pub price_usd: Option<f64>,
+    pub volatility: f64,
+}
 
-/// Enum describing various Miner Extractable Value (MEV) opportunity types
-/// that the client can detect by analyzing live mempool transactions.
-///
-/// This enumeration is extensible to support additional MEV patterns as
-/// detection strategies evolve.
-///
-/// - **Sandwich attacks:** Exploiting victim swaps with a buy front-run and sell back-run.
-/// - **Arbitrage:** Profiting from price differences across liquidity pools.
-/// - **Liquidations:** Capturing profit from undercollateralized loan liquidations.
-///
-/// Each variant carries relevant metadata to support downstream decision-making,
-/// including involved transactions and profit estimates.
+#[derive(Debug, Clone)]
+pub struct PoolInfo {
+    pub address: PoolAddress,
+    pub dex: DexType,
+    pub token0: TokenInfo,
+    pub token1: TokenInfo,
+    pub fee: u32,
+    pub tick_spacing: i32,
+    pub last_updated: Instant,
+    pub historical_volume: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DexType {
+    UniswapV2,
+    UniswapV3,
+    SushiSwap,
+    PancakeSwap,
+    Curve,
+    BalancerV2,
+    Dodo,
+    Bancor,
+}
+
+#[derive(Debug, Clone)]
+pub struct PriceQuote {
+    pub pool: PoolAddress,
+    pub dex: DexType,
+    pub price: f64,
+    pub liquidity: U256,
+    pub impact: f64,
+    pub timestamp: Instant,
+    pub gas_cost: GasCost,
+    pub confidence: f64,
+    pub block_number: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArbitrageOpportunity {
+    pub path: Vec<PoolInfo>,
+    pub token_path: Vec<TokenInfo>,
+    pub expected_prices: Vec<f64>,
+    pub expected_profit: f64,
+    pub expected_profit_percentage: f64,
+    pub optimal_amount: U256,
+    pub total_gas_cost: GasCost,
+    pub net_profit: f64,
+    pub confidence_score: f64,
+    pub risk_score: f64,
+    pub max_slippage: f64,
+    pub min_amount_out: U256,
+    pub first_seen: Instant,
+    pub last_updated: Instant,
+}
+
 #[derive(Debug)]
-enum MevOpportunity {
-    /// Represents a sandwich attack opportunity.
-    ///
-    /// This pattern involves placing transactions immediately before and after
-    /// a large victim transaction to capitalize on price slippage.
-    Sandwich {
-        frontrun_tx: Transaction,  // Transaction that front-runs victim
-        victim_tx: Transaction,    // Targeted victim transaction
-        backrun_tx: Transaction,   // Transaction that back-runs victim
-        profit_estimate: U256,     // Estimated profit from this sequence in wei
-    },
-
-    /// Represents a profitable arbitrage route.
-    ///
-    /// The `path` is a vector of pool addresses (H160) which the arbitrage trades through.
-    Arbitrage {
-        path: Vec<H160>,
-        profit: U256,
-    },
-
-    /// Represents a liquidation opportunity in lending protocols.
-    ///
-    /// Liquidator address and debt position address are provided to
-    /// precisely identify the actors and contracts involved.
-    Liquidation {
-        liquidator: H160,
-        debt_position: H160,
-        profit: U256,
-    },
+pub struct CircuitBreaker {
+    pub max_daily_loss: f64,
+    pub max_position_size: U256,
+    pub min_profit_threshold: f64,
+    pub max_concurrent_trades: usize,
+    pub current_metrics: Arc<RwLock<TradingMetrics>>,
+    pub is_active: Arc<RwLock<bool>>,
 }
 
-impl EthClient {
-    /// Initializes a new `EthClient` instance with the provided HTTP and WebSocket RPC URLs.
-    ///
-    /// Performs initial synchronization checks to verify that both providers
-    /// are closely aligned in terms of the blockchain height.
-    ///
-    /// # Failure Scenarios
-    ///
-    /// - Fails if unable to instantiate HTTP provider.
-    /// - Fails if unable to establish WebSocket connection.
-    /// - Fails if HTTP and WS block numbers differ by more than 3 blocks,
-    ///   as this indicates a potential desync issue that could cause inconsistent data reads.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a ready-to-use `EthClient` or an error describing
-    /// the failure point.
-    pub async fn new(rpc_url: &str, ws_url: &str) -> Result<Self> {
-        // Attempt to create the HTTP provider synchronously.
-        // This can fail if the URL is malformed or unreachable.
-        let http = Provider::<Http>::try_from(rpc_url)
-            .context("Failed to create HTTP provider")?;
+#[derive(Debug)]
+pub struct TradingMetrics {
+    pub daily_pnl: f64,
+    pub weekly_pnl: f64,
+    pub total_trades: u64,
+    pub successful_trades: u64,
+    pub failed_trades: u64,
+    pub total_volume: U256,
+    pub last_reset: u64, // Unix timestamp
+    pub concurrent_trades: usize,
+}
 
-        // Connect asynchronously to the WebSocket provider.
-        // This may fail due to networking issues or invalid URLs.
-        let ws = Provider::<Ws>::connect(ws_url)
-            .await
-            .context("Failed to connect to WS provider")?;
-
-        // Fetch the current block number from both providers.
-        // This ensures they are both synced to roughly the same chain height.
-        let http_block = http.get_block_number().await.context("HTTP block fetch failed")?.as_u64();
-        let ws_block = ws.get_block_number().await.context("WS block fetch failed")?.as_u64();
-
-        // Check for desynchronization beyond a safe threshold.
-        // A 3-block difference is an empirically chosen tolerance to handle minor chain reorganizations or lag.
-        if http_block.abs_diff(ws_block) > 3 {
-            anyhow::bail!(
-                "Providers out of sync (HTTP: {}, WS: {})",
-                http_block,
-                ws_block
-            );
-        }
-
-        // Construct the client struct.
-        Ok(Self {
-            http: Arc::new(http),
-            ws: Arc::new(ws),
-            current_block: http_block,
-            http_alive: Arc::new(AtomicBool::new(true)),
-        })
-    }
-
-    /// Fetches the latest block number from the blockchain.
-    ///
-    /// Uses HTTP provider preferentially for efficiency.
-    /// Falls back to WebSocket provider on HTTP failure.
-    ///
-    /// Updates the internal `current_block` cache on success.
-    ///
-    /// # Rationale
-    ///
-    /// Using HTTP first often provides faster responses for individual calls,
-    /// but WebSocket acts as a resilient fallback when HTTP is slow, rate-limited,
-    /// or disconnected.
-    ///
-    /// # Edge Cases
-    ///
-    /// If both providers fail, returns an error propagated from the last failed attempt.
-    pub async fn get_block(&mut self) -> Result<u64> {
-        match self.http.get_block_number().await {
-            Ok(block) => {
-                self.current_block = block.as_u64();
-                Ok(self.current_block)
-            }
-            Err(e) => {
-                // Log the failure, then fallback to WebSocket provider.
-                eprintln!("HTTP failed, falling back to WS: {}", e);
-                let block = self.ws.get_block_number().await?;
-                self.current_block = block.as_u64();
-                Ok(self.current_block)
-            }
+impl Default for TradingMetrics {
+    fn default() -> Self {
+        Self {
+            daily_pnl: 0.0,
+            weekly_pnl: 0.0,
+            total_trades: 0,
+            successful_trades: 0,
+            failed_trades: 0,
+            total_volume: U256::zero(),
+            last_reset: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            concurrent_trades: 0,
         }
     }
+}
 
-    /// Simulates HTTP provider failure by replacing it with an invalid endpoint.
-    ///
-    /// Useful for testing client failover behavior during HTTP outages.
-    ///
-    /// # Important
-    ///
-    /// This method is destructive: once called, the client will rely solely on WebSocket
-    /// provider until reset.
-    pub fn kill_http(&mut self) {
-        // Replace HTTP provider with an obviously invalid URL to simulate failure.
-        self.http = Arc::new(Provider::<Http>::try_from("http://invalid.url").unwrap());
-        // Mark HTTP as not alive (optional: could set http_alive=false here as well)
+pub struct PriceOracle {
+    providers: HashMap<DexType, Arc<Provider<Ws>>>,
+    price_cache: Arc<RwLock<HashMap<(TokenAddress, TokenAddress), PriceDataPoint>>>,
+    stablecoin_oracle: Arc<dyn StablecoinOracle + Send + Sync>,
+    validator: Arc<PriceValidator>,
+    config: Arc<BotConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct PriceDataPoint {
+    price: f64,
+    timestamp: Instant,
+    block_number: u64,
+    sources: usize,
+    liquidity: U256,
+}
+
+#[async_trait]
+pub trait StablecoinOracle: Send + Sync {
+    fn get_price(&self, token: TokenAddress) -> BoxFuture<'_, Result<f64>>;
+}
+
+pub struct PriceValidator {
+    arbitrage_checker: Arc<ArbitrageChecker>,
+    max_price_deviation: f64,
+}
+
+pub struct ArbitrageChecker {
+    uniswap_router: Address,
+    sushi_router: Address,
+    client: Arc<Provider<Http>>,
+}
+
+impl ArbitrageChecker {
+    pub async fn check_arbitrage(
+        &self,
+        token_a: TokenAddress,
+        token_b: TokenAddress,
+        price: f64,
+    ) -> Result<bool> {
+        let uniswap_price = self.get_uniswap_price(token_a, token_b).await?;
+        let sushi_price = self.get_sushi_price(token_a, token_b).await?;
+
+        let uniswap_diff = (price - uniswap_price).abs() / uniswap_price;
+        let sushi_diff = (price - sushi_price).abs() / sushi_price;
+
+        Ok(uniswap_diff > 0.01 || sushi_diff > 0.01)
     }
 
-    /// Retrieves a transaction by its hash.
-    ///
-    /// Prefers HTTP provider if healthy, else falls back to WebSocket provider.
-    ///
-    /// # Behavior
-    ///
-    /// - If HTTP is marked alive, tries HTTP first.
-    /// - If HTTP request fails, logs error and falls back to WS.
-    /// - If HTTP is not alive, directly queries WS.
-    ///
-    /// # Return
-    ///
-    /// `Ok(Some(Transaction))` if transaction found,
-    /// `Ok(None)` if transaction does not exist,
-    /// or `Err` if both providers fail.
-    pub async fn get_transaction(&self, tx_hash: ethers::types::TxHash) -> Result<Option<Transaction>> {
-        if self.http_alive.load(Ordering::SeqCst) {
-            match self.http.get_transaction(tx_hash).await {
-                Ok(tx) => Ok(tx),
-                Err(e) => {
-                    eprintln!("HTTP failed, falling back to WS: {}", e);
-                    self.ws.get_transaction(tx_hash).await.context("Failed via WS")
+    async fn get_uniswap_price(&self, token_in: TokenAddress, token_out: TokenAddress) -> Result<f64> {
+        let router = IUniswapV2Router02::new(self.uniswap_router, Arc::new(self.client.as_ref().clone()));
+        let path = vec![token_in, token_out];
+        let amounts = router.get_amounts_out(U256::from(10).pow(18.into()), path).call().await?;
+        Ok(amounts[1].as_u128() as f64 / 1e18)
+    }
+
+    async fn get_sushi_price(&self, token_in: TokenAddress, token_out: TokenAddress) -> Result<f64> {
+        let router = ISushiRouter::new(self.sushi_router, Arc::new(self.client.as_ref().clone()));
+        let path = vec![token_in, token_out];
+        let amounts = router.get_amounts_out(U256::from(10).pow(18.into()), path).call().await?;
+        Ok(amounts[1].as_u128() as f64 / 1e18)
+    }
+}
+
+impl PriceOracle {
+    pub async fn get_real_price(&self, token_in: TokenAddress, token_out: TokenAddress) -> Result<f64> {
+        let mut prices = Vec::new();
+        let mut liquidities = Vec::new();
+
+        for (dex, provider) in &self.providers {
+            match dex {
+                DexType::UniswapV3 => {
+                    if let Ok(pool) = self.get_uniswap_v3_pool(token_in, token_out).await {
+                        if let Ok((price, liquidity)) = self.get_uniswap_v3_price(provider, pool).await {
+                            prices.push(price);
+                            liquidities.push(liquidity);
+                        }
+                    }
                 }
-            }
-        } else {
-            self.ws.get_transaction(tx_hash).await.context("Failed via WS")
-        }
-    }
-
-    /// Subscribes to new blocks via WebSocket and prints block info.
-    ///
-    /// This live subscription is essential for building real-time block explorers,
-    /// MEV bots, or indexers.
-    ///
-    /// # Flow
-    ///
-    /// - Opens a subscription stream for new blocks.
-    /// - For each block received, prints block number, number of txs, and gas used.
-    ///
-    /// # Notes
-    ///
-    /// The function runs indefinitely until the stream ends or an error occurs.
-    pub async fn stream_blocks(&self) -> Result<()> {
-        let mut stream = self.ws.subscribe_blocks().await?;
-        while let Some(block) = stream.next().await {
-            println!(
-                "New Block #{}: {} txs, {} gas used",
-                block.number.unwrap_or_default(),
-                block.transactions.len(),
-                block.gas_used.unwrap_or_default()
-            );
-        }
-        Ok(())
-    }
-
-    /// Subscribes to live pending transactions from the mempool.
-    ///
-    /// For each pending transaction hash, fetches full tx data and prints summary.
-    ///
-    /// # Behavior
-    ///
-    /// - If tx disappears between notification and fetch, logs disappearance.
-    /// - Errors in fetching are logged but do not halt the subscription.
-    ///
-    /// # Usage
-    ///
-    /// Useful for mempool monitoring, MEV detection, or front-running strategies.
-    pub async fn stream_pending_txs(&self) -> Result<()> {
-        let mut stream = self.ws.subscribe_pending_txs().await?;
-        while let Some(tx_hash) = stream.next().await {
-            match self.get_transaction(tx_hash).await {
-                Ok(Some(tx)) => {
-                    println!(
-                        "Pending Tx: {} => {}, gas:{}, value:{} ETH",
-                        tx.from,
-                        tx.to.unwrap_or_default(),
-                        tx.gas,
-                        format_units(tx.value, "ether")?
-                    );
+                DexType::SushiSwap => {
+                    if let Ok((price, liquidity)) = self.get_sushiswap_price(provider, token_in, token_out).await {
+                        prices.push(price);
+                        liquidities.push(liquidity);
+                    }
                 }
-                Ok(None) => println!("Transaction disappeared from mempool"),
-                Err(e) => println!("Error fetching transaction: {}", e),
+                _ => continue,
             }
         }
-        Ok(())
+
+        if prices.is_empty() {
+            return Err(anyhow::anyhow!("No price data available"));
+        }
+
+        let total_liquidity: U256 = liquidities.iter().fold(U256::zero(), |acc, x| acc + *x);
+        if total_liquidity.is_zero() {
+            return Ok(prices.iter().sum::<f64>() / prices.len() as f64);
+        }
+
+        let weighted_price = prices.iter().zip(liquidities.iter())
+            .map(|(p, l)| p * l.as_u128() as f64)
+            .sum::<f64>() / total_liquidity.as_u128() as f64;
+
+        Ok(weighted_price)
     }
 
-    /// Placeholder for detecting MEV opportunities from live pending transactions.
-    ///
-    /// This function collects pending transactions into a mempool snapshot and runs
-    /// detection logic for sandwich attacks and other MEV strategies.
-    ///
-    /// # Details
-    ///
-    /// - Listens indefinitely to pending txs via WS.
-    /// - Calls `detect_sandwich` (not implemented here) for each tx.
-    /// - Accumulates opportunities and returns on stream termination.
-    pub async fn detect_mev(&self) -> Result<Vec<MevOpportunity>> {
+    async fn get_uniswap_v3_pool(&self, token_a: TokenAddress, token_b: TokenAddress) -> Result<PoolAddress> {
+        let factory = IUniswapV3Factory::new(*UNISWAP_V3_FACTORY, self.providers[&DexType::UniswapV3].clone());
+        let pool = factory.get_pool(token_a, token_b, 3000).call().await?;
+        Ok(pool)
+    }
+
+    async fn get_uniswap_v3_price(&self, provider: &Provider<Ws>, pool: PoolAddress) -> Result<(f64, U256)> {
+        let pool_contract = IUniswapV3Pool::new(pool, Arc::new(provider.clone()));
+        let slot0 = pool_contract.slot_0().call().await?;
+        let liquidity = pool_contract.liquidity().call().await?;
+
+        let sqrt_price_x96 = slot0.0;
+        let price = (sqrt_price_x96.as_u128() as f64).powi(2) / 2f64.powi(192);
+
+        Ok((price, U256::from(liquidity)))
+    }
+
+    async fn get_sushiswap_price(&self, provider: &Provider<Ws>, token_in: TokenAddress, token_out: TokenAddress) -> Result<(f64, U256)> {
+        let router = ISushiRouter::new(*SUSHI_ROUTER, Arc::new(provider.clone()));
+        let path = vec![token_in, token_out];
+        let amounts = router.get_amounts_out(U256::from(10).pow(18.into()), path).call().await?;
+        
+        let factory = IUniswapV2Factory::new(*SUSHI_FACTORY, Arc::new(provider.clone()));
+        let pair = factory.get_pair(token_in, token_out).call().await?;
+        let pair_contract = IUniswapV2Pair::new(pair, Arc::new(provider.clone()));
+        let reserves = pair_contract.get_reserves().call().await?;
+        let liquidity = U256::from(reserves.0) + U256::from(reserves.1);
+
+        Ok((amounts[1].as_u128() as f64 / 1e18, liquidity))
+    }
+}
+
+pub struct ArbitrageEngine {
+    oracle: Arc<PriceOracle>,
+    circuit_breaker: Arc<CircuitBreaker>,
+    pools: Vec<PoolInfo>,
+    config: Arc<BotConfig>,
+    trade_executor: Arc<TradeExecutor>,
+    opportunity_queue: Arc<Mutex<VecDeque<ArbitrageOpportunity>>>,
+    historical_opportunities: Arc<RwLock<Vec<ArbitrageOpportunity>>>,
+    mev_protection: Arc<MevProtection>,
+}
+
+pub struct MevProtection {
+    pub max_priority_fee_per_gas: U256,
+    pub min_priority_fee_per_gas: U256,
+    pub flashbots_enabled: bool,
+    pub private_rpc_url: Option<String>,
+}
+
+impl ArbitrageEngine {
+    pub async fn find_multi_hop_arbitrage(&self, max_hops: usize) -> Result<Vec<ArbitrageOpportunity>> {
+        let mut adjacency = HashMap::new();
+        for pool in &self.pools {
+            adjacency.entry(pool.token0.address).or_insert_with(Vec::new).push(pool);
+            adjacency.entry(pool.token1.address).or_insert_with(Vec::new).push(pool);
+        }
+
         let mut opportunities = Vec::new();
-        let mut pending_txs = HashMap::new();
-
-        let mut stream = self.ws.subscribe_pending_txs().await?;
-        while let Some(tx_hash) = stream.next().await {
-            if let Ok(Some(tx)) = self.get_transaction(tx_hash).await {
-                if let Some(opp) = self.detect_sandwich(&tx, &pending_txs).await {
-                    opportunities.push(opp);
-                }
-                pending_txs.insert(tx.hash, tx);
-            }
+        for start_token in adjacency.keys() {
+            let mut visited = VecDeque::new();
+            visited.push_back(*start_token);
+            self.dfs_find_arbitrage(
+                *start_token,
+                *start_token,
+                max_hops,
+                &mut Vec::new(),
+                &mut visited,
+                &mut opportunities,
+                &adjacency,
+            )
+            .await?;
         }
+
         Ok(opportunities)
     }
 
-    /// Fetches recent fee history and computes an optimal gas price according to EIP-1559.
-    ///
-    /// # Computation details:
-    ///
-    /// - Requests fee history over last 5 blocks with 50th percentile priority fee.
-    /// - Uses the earliest base fee as reference.
-    /// - Adds a fixed priority fee (tip) of 2 Gwei to incentivize miners.
-    /// - Adds a 25% buffer over base fee to reduce underpricing risk.
-    ///
-    /// # Overflow handling:
-    ///
-    /// The arithmetic uses checked operations to avoid integer overflow panics,
-    /// returning an error if overflow occurs.
-    pub async fn get_optimal_gas_price(&self) -> Result<U256> {
-        let fee_history = self
-            .ws
-            .fee_history(5, BlockNumber::Latest, &[50.0])
-            .await
-            .context("Failed to get fee history")?;
-
-        // The base fee per gas for the earliest block in the history
-        let base_fee = *fee_history
-            .base_fee_per_gas
-            .first()
-            .ok_or_else(|| anyhow!("No base fee found in fee history"))?;
-
-        // Fixed priority fee (tip) set to 2 Gwei
-        let max_priority_fee = U256::from(2_000_000_000u64);
-
-        // Max fee is base fee + 25% buffer
-        let max_fee = base_fee
-            .checked_mul(U256::from(125))
-            .and_then(|v| v.checked_div(U256::from(100)))
-            .ok_or_else(|| anyhow!("Gas price calculation overflow"))?;
-
-        Ok(max_fee + max_priority_fee)
-    }
-
-    /// Simulates a transaction request by converting it to a TypedTransaction and
-    /// then simulating the resulting Transaction.
-    ///
-    /// # Implementation details:
-    ///
-    /// - Converts `TransactionRequest` (builder) into `TypedTransaction` (final tx format).
-    /// - Manually constructs a `Transaction` struct using fields extracted from `TypedTransaction`.
-    /// - Calls `simulate_tx` to perform the simulation RPC call.
-    ///
-    /// # Notes:
-    ///
-    /// This simulation does not send the tx but queries the node for execution outcome,
-    /// gas used, and success status, useful for pre-checking before actual submission.
-    pub async fn simulate_tx_request(
+    async fn dfs_find_arbitrage(
         &self,
-        tx_request: &TransactionRequest,
-    ) -> Result<(bool, U256)> {
-        let typed_tx: TypedTransaction = tx_request.clone().into();
+        current_token: TokenAddress,
+        start_token: TokenAddress,
+        remaining_hops: usize,
+        current_path: &mut Vec<PoolInfo>,
+        visited: &mut VecDeque<TokenAddress>,
+        opportunities: &mut Vec<ArbitrageOpportunity>,
+        adjacency: &HashMap<TokenAddress, Vec<&PoolInfo>>,
+    ) -> Result<()> {
+        if remaining_hops == 0 {
+            return Ok(());
+        }
 
-        // Construct a mock Transaction from the TypedTransaction fields
-        let mock_tx = Transaction {
-            hash: typed_tx.sighash(),
-            nonce: typed_tx.nonce().cloned().unwrap_or_default(),
-            from: typed_tx.from().map(|f| *f).unwrap_or_default(),
-            to: typed_tx.to().and_then(|addr| match addr {
-                NameOrAddress::Address(a) => Some(*a),
-                NameOrAddress::Name(_) => None,
-            }),
-            value: typed_tx.value().cloned().unwrap_or_default(),
-            gas: typed_tx.gas().cloned().unwrap_or_default(),
-            gas_price: typed_tx.gas_price().map(|gp| gp.clone()),
-            input: typed_tx.data().cloned().unwrap_or_default(),
-            ..Default::default()
-        };
+        if let Some(pools) = adjacency.get(&current_token) {
+            for pool in pools {
+                let next_token = if pool.token0.address == current_token {
+                    pool.token1.address
+                } else {
+                    pool.token0.address
+                };
 
-        self.simulate_tx(&mock_tx).await
-    }
+                let mut new_path = current_path.clone();
+                new_path.push((*pool).clone());
 
-    /// Simulates a given Transaction by calling `eth_call` RPC method.
-    ///
-    /// Also fetches transaction receipt to confirm gas usage and success status.
-    ///
-    /// # Workflow:
-    ///
-    /// 1. Call `eth_call` with the transaction data and no block override (latest).
-    /// 2. Fetch transaction receipt to get gas used and status.
-    /// 3. Return tuple of `(success, gas_used)`.
-    ///
-    /// # Edge Cases:
-    ///
-    /// - Returns error if receipt is missing (transaction not mined).
-    /// - Returns error if gas used is missing (node issue).
-    /// - Success is determined by whether eth_call returned non-empty result.
-    pub async fn simulate_tx(&self, tx: &Transaction) -> Result<(bool, U256)> {
-        // RPC call to simulate tx execution (eth_call)
-        let result = self.ws.call(&tx.clone().into(), None).await?;
-
-        // Retrieve the transaction receipt for gas and status
-        let receipt = self
-            .ws
-            .get_transaction_receipt(tx.hash)
-            .await?
-            .ok_or_else(|| anyhow!("Transaction receipt not found"))?;
-
-        let gas_used = receipt
-            .gas_used
-            .ok_or_else(|| anyhow!("Gas used not available in receipt"))?;
-
-        // Determine success: non-empty eth_call result implies success
-        let success = !result.is_empty();
-
-        Ok((success, U256::from(gas_used)))
-    }
-}
-
-// ============================================================================
-// MAIN ENTRY POINT
-// ============================================================================
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // RPC URLs: change to your preferred providers.
-    let rpc_url = "https://eth.llamarpc.com";
-    let ws_url = "wss://eth.llamarpc.com";
-
-    // Initialize Ethereum client with both HTTP and WS providers.
-    let mut client = EthClient::new(rpc_url, ws_url).await?;
-
-    // Fetch and print optimal gas price based on recent network conditions.
-    match client.get_optimal_gas_price().await {
-        Ok(gas_price) => println!("Optimal gas price: {} Gwei", format_units(gas_price, "gwei")?),
-        Err(e) => eprintln!("Error getting gas price: {}", e),
-    }
-
-    // Create a sample transaction request sending 0.1 ETH to Vitalik's address.
-    let sample_tx = TransactionRequest::new()
-        .to("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".parse::<H160>()?)
-        .value(100_000_000_000_000_000_u64); // 0.1 ETH in wei
-
-    // Convert request to TypedTransaction (required by ethers-rs)
-    let typed_tx: TypedTransaction = sample_tx.clone().into();
-
-    // Estimate gas required by the sample transaction.
-    let gas_estimate = client.http.estimate_gas(&typed_tx, None).await?;
-
-    // Update transaction with gas estimate and optimal gas price.
-    let sample_tx = sample_tx
-        .gas(gas_estimate)
-        .gas_price(client.get_optimal_gas_price().await?);
-
-    // Simulate the transaction and output success status and gas used.
-    let (success, gas) = client.simulate_tx_request(&sample_tx).await?;
-    println!("Simulation result: success = {}, gas = {}", success, gas);
-
-    // Print current blockchain head block number.
-    println!("Current block: {}", client.get_block().await?);
-
-    // Uncomment to simulate HTTP failure and test failover behavior.
-    // println!("Simulate HTTP failure...");
-    // client.kill_http();
-    // std::thread::sleep(std::time::Duration::from_secs(10));
-    // println!("Fallback block: {}", client.get_block().await?);
-
-    // Clone client handle to move into async block for streaming blocks.
-    let client_clone = client.clone();
-
-    // Spawn a new async task to print new blocks as they arrive.
-    tokio::spawn(async move {
-        client_clone.stream_blocks().await.unwrap();
-    });
-
-    // Start streaming pending transactions indefinitely.
-    // On failure, retry after 1 second delay to handle transient connection issues.
-    loop {
-        match client.stream_pending_txs().await {
-            Ok(_) => break,
-            Err(e) => {
-                eprintln!("Stream failed, restarting: {}", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                if next_token == start_token && new_path.len() > 1 {
+                    if let Some(opportunity) = self.analyze_arbitrage_loop(&new_path).await? {
+                        opportunities.push(opportunity);
+                    }
+                } else if !visited.contains(&next_token) {
+                    visited.push_back(next_token);
+                    Box::pin(self.dfs_find_arbitrage(
+                        next_token,
+                        start_token,
+                        remaining_hops - 1,
+                        &mut new_path,
+                        visited,
+                        opportunities,
+                        adjacency,
+                    ))
+                    .await?;
+                    visited.pop_back();
+                }
             }
+        }
+
+        Ok(())
+    }
+
+    async fn analyze_arbitrage_loop(&self, path: &[PoolInfo]) -> Result<Option<ArbitrageOpportunity>> {
+        let mut amount_in = self.config.max_trade_size;
+        let mut token_path = Vec::new();
+        let mut expected_prices = Vec::new();
+        let mut total_gas = U256::zero();
+
+        if let Some(first_pool) = path.first() {
+            token_path.push(if path.len() > 1 {
+                if path[1].token0.address == first_pool.token0.address 
+                    || path[1].token1.address == first_pool.token0.address {
+                    first_pool.token1.clone()
+                } else {
+                    first_pool.token0.clone()
+                }
+            } else {
+                first_pool.token0.clone()
+            });
+        }
+
+        for (i, pool) in path.iter().enumerate() {
+            let token_in = if i == 0 {
+                token_path[0].address
+            } else {
+                token_path[i-1].address
+            };
+
+            let (amount_out, gas_cost) = self.simulate_swap(
+                pool.address,
+                token_in,
+                amount_in,
+                pool.dex,
+            ).await?;
+
+            expected_prices.push(amount_out.as_u128() as f64 / amount_in.as_u128() as f64);
+            total_gas += gas_cost;
+
+            if i < path.len() - 1 {
+                amount_in = amount_out;
+                token_path.push(
+                    if pool.token0.address == token_in {
+                        pool.token1.clone()
+                    } else {
+                        pool.token0.clone()
+                    }
+                );
+            }
+        }
+
+        let profit = amount_in.as_u128() as f64 / self.config.max_trade_size.as_u128() as f64 - 1.0;
+        let net_profit = profit - total_gas.as_u128() as f64 / 1e18;
+
+        if net_profit > self.config.min_profit_threshold {
+            Ok(Some(ArbitrageOpportunity {
+                path: path.to_vec(),
+                token_path,
+                expected_prices,
+                expected_profit: profit,
+                expected_profit_percentage: profit * 100.0,
+                optimal_amount: self.config.max_trade_size,
+                total_gas_cost: total_gas,
+                net_profit,
+                confidence_score: 0.9,
+                risk_score: 0.1,
+                max_slippage: self.config.max_slippage,
+                min_amount_out: amount_in * (U256::from(10000) - U256::from((self.config.max_slippage * 100.0) as u128)) / U256::from(10000),
+                first_seen: Instant::now(),
+                last_updated: Instant::now(),
+            }))
+        } else {
+            Ok(None)
         }
     }
 
-    Ok(())
+    async fn simulate_swap(
+        &self,
+        _pool: PoolAddress,
+        token_in: TokenAddress,
+        amount_in: U256,
+        dex: DexType,
+    ) -> Result<(U256, U256)> {
+        match dex {
+            DexType::UniswapV3 => {
+                let quoter = IUniswapV2Router02::new(*UNISWAP_V3_ROUTER, self.trade_executor.client.clone());
+                let path = vec![token_in, token_in]; // This should be properly implemented with actual token pairs
+                let amounts = quoter.get_amounts_out(amount_in, path).call().await?;
+                Ok((amounts[1], U256::from(100_000)))
+            }
+            DexType::SushiSwap => {
+                let router = ISushiRouter::new(*SUSHI_ROUTER, self.trade_executor.client.clone());
+                let path = vec![token_in, token_in]; // This should be properly implemented with actual token pairs
+                let amounts = router.get_amounts_out(amount_in, path).call().await?;
+                Ok((amounts[1], U256::from(120_000)))
+            }
+            _ => Err(anyhow::anyhow!("DEX not implemented")),
+        }
+    }
+
+    pub async fn simulate_trade(&self, opportunity: &ArbitrageOpportunity) -> Result<SimulationResult> {
+        let mut amount_in = opportunity.optimal_amount;
+        let mut total_gas = U256::zero();
+
+        for (i, pool) in opportunity.path.iter().enumerate() {
+            let token_in = opportunity.token_path[i].address;
+            let (amount_out, gas_cost) = self.simulate_swap(
+                pool.address,
+                token_in,
+                amount_in,
+                pool.dex,
+            ).await?;
+            amount_in = amount_out;
+            total_gas += gas_cost;
+        }
+
+        let profit = amount_in.as_u128() as f64 / opportunity.optimal_amount.as_u128() as f64 - 1.0;
+        let net_profit = profit - total_gas.as_u128() as f64 / 1e18;
+
+        Ok(SimulationResult {
+            success: net_profit > self.config.min_profit_threshold,
+            actual_profit: net_profit,
+            gas_used: total_gas,
+            revert_reason: None,
+        })
+    }
+
+    pub async fn monitor_opportunity(&self, opportunity: ArbitrageOpportunity) {
+        let mut queue = self.opportunity_queue.lock().await;
+        queue.push_back(opportunity);
+    }
+}
+
+#[async_trait]
+pub trait FlashLoanProvider: Send + Sync {
+    fn execute_flash_loan(
+        &self,
+        _amount: U256,
+        _token: TokenAddress,
+        _pools: Vec<PoolAddress>,
+    ) -> BoxFuture<'_, Result<TxHash>>;
+    
+    fn estimate_flash_loan_fee(
+        &self,
+        amount: U256,
+        _token: TokenAddress,
+    ) -> BoxFuture<'_, Result<U256>>;
+}
+
+pub struct AaveFlashLoanProvider {
+    client: Arc<Provider<Http>>,
+    lending_pool: Address,
+}
+
+#[async_trait]
+impl FlashLoanProvider for AaveFlashLoanProvider {
+    fn execute_flash_loan(
+        &self,
+        _amount: U256,
+        _token: TokenAddress,
+        _pools: Vec<PoolAddress>,
+    ) -> BoxFuture<'_, Result<TxHash>> {
+        Box::pin(async move {
+            let tx = TransactionRequest::new()
+                .to(self.lending_pool)
+                .data(vec![]);
+            let pending_tx = self.client.send_transaction(tx, None).await?;
+            Ok(pending_tx.tx_hash())
+        })
+    }
+
+    fn estimate_flash_loan_fee(
+        &self,
+        amount: U256,
+        _token: TokenAddress,
+    ) -> BoxFuture<'_, Result<U256>> {
+        Box::pin(async move {
+            Ok(amount * U256::from(9) / U256::from(10000))
+        })
+    }
+}
+
+pub struct TradeExecutor {
+    client: Arc<Provider<Http>>,
+    flash_loan_providers: Vec<Arc<AaveFlashLoanProvider>>,
+    config: Arc<BotConfig>,
+    pending_txs: Arc<Mutex<HashMap<TxHash, Instant>>>,
+    mev_protection: Arc<MevProtection>,
+}
+
+impl TradeExecutor {
+    pub async fn execute_with_mev_protection(
+        &self,
+        tx: TransactionRequest,
+        mev_params: &MevProtection,
+    ) -> Result<TxHash> {
+        if mev_params.flashbots_enabled {
+            error!("Flashbots not implemented in this example");
+            Err(anyhow::anyhow!("Flashbots not implemented"))
+        } else if let Some(private_rpc) = &mev_params.private_rpc_url {
+            let provider = Provider::<Http>::try_from(private_rpc)?;
+            let pending_tx = provider.send_transaction(tx, None).await?;
+            Ok(pending_tx.tx_hash())
+        } else {
+            let pending_tx = self.client.send_transaction(tx, None).await?;
+            Ok(pending_tx.tx_hash())
+        }
+    }
+
+    pub async fn wait_for_tx_with_retries(&self, tx_hash: TxHash) -> Result<()> {
+        for _ in 0..self.config.max_trade_retries {
+            if let Some(receipt) = self.client.get_transaction_receipt(tx_hash).await? {
+                if receipt.status == Some(1.into()) {
+                    return Ok(());
+                } else {
+                    return Err(anyhow::anyhow!("Transaction failed"));
+                }
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        Err(anyhow::anyhow!("Transaction timeout"))
+    }
+
+    pub async fn execute(&self, opportunity: ArbitrageOpportunity) -> Result<TxHash> {
+        let _flash_loan_tx = self.flash_loan_providers[0]
+            .execute_flash_loan(
+                opportunity.optimal_amount,
+                opportunity.token_path[0].address,
+                opportunity.path.iter().map(|p| p.address).collect(),
+            )
+            .await?;
+
+        let tx = TransactionRequest::new()
+            .to(*AAVE_LENDING_POOL)
+            .data(vec![]);
+
+        self.execute_with_mev_protection(tx, &self.mev_protection).await
+    }
+}
+
+pub struct HealthCheck {
+    last_heartbeat: Arc<RwLock<Instant>>,
+    max_latency: Duration,
+}
+
+impl HealthCheck {
+    pub async fn check(&self) -> Result<()> {
+        let now = Instant::now();
+        let last = *self.last_heartbeat.read().await;
+        if now.duration_since(last) > self.max_latency {
+            Err(anyhow::anyhow!("Health check failed - latency too high"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub struct SimulationResult {
+    pub success: bool,
+    pub actual_profit: f64,
+    pub gas_used: U256,
+    pub revert_reason: Option<String>,
+}
+
+pub struct ArbitrageBot {
+    engine: Arc<ArbitrageEngine>,
+    executor: Arc<TradeExecutor>,
+    config: Arc<BotConfig>,
+    health_check: Arc<HealthCheck>,
+}
+
+impl ArbitrageBot {
+    pub async fn run(&self) -> Result<()> {
+        let finder = self.find_opportunities();
+        let executor = self.execute_opportunities();
+        let health = self.monitor_health();
+
+        tokio::try_join!(finder, executor, health)?;
+        Ok(())
+    }
+
+    async fn find_opportunities(&self) -> Result<()> {
+        loop {
+            match self.engine.find_multi_hop_arbitrage(3).await {
+                Ok(opportunities) => {
+                    for opp in opportunities {
+                        if opp.confidence_score > 0.9 && opp.risk_score < 0.2 {
+                            self.engine.monitor_opportunity(opp).await;
+                        }
+                    }
+                }
+                Err(e) => error!("Error finding opportunities: {}", e),
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn execute_opportunities(&self) -> Result<()> {
+        loop {
+            let opportunity = {
+                let mut queue = self.engine.opportunity_queue.lock().await;
+                queue.pop_front()
+            };
+
+            if let Some(opp) = opportunity {
+                match self.executor.execute(opp).await {
+                    Ok(tx_hash) => info!("Executed arbitrage: {:?}", tx_hash),
+                    Err(e) => error!("Execution failed: {}", e),
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn monitor_health(&self) -> Result<()> {
+        loop {
+            if let Err(e) = self.health_check.check().await {
+                error!("Health check failed: {}", e);
+            }
+            sleep(Duration::from_secs(5)).await;
+        }
+    }
+}
+
+struct MockStablecoinOracle;
+
+#[async_trait]
+impl StablecoinOracle for MockStablecoinOracle {
+    fn get_price(&self, _token: TokenAddress) -> BoxFuture<'_, Result<f64>> {
+        Box::pin(async move { Ok(1.0) })
+    }
+}
+
+// Example usage and main function
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenv().ok();
+    let infura_key = std::env::var("INFURA_KEY")
+         .expect("INFURA_KEY must be set in .env file");
+    tracing_subscriber::fmt::init();
+
+    // Initialize configuration
+    let config = Arc::new(BotConfig {
+        max_trade_size: U256::from(10).pow(18.into()),
+        min_profit_threshold: 0.1, // 0.1% minimum profit
+        max_slippage: 0.5,
+        max_price_impact: 1.0,
+        gas_price_multiplier: 1.2,
+        max_concurrent_trades: 3,
+        max_trade_retries: 3,
+        max_tx_wait_time: Duration::from_secs(30),
+        flash_loan_fee: 0.0009,
+        profit_estimation_buffer: 0.1,
+    });
+
+    // Set up providers - Use your actual RPC endpoints
+    let http_provider = Provider::<Http>::try_from(format!("https://mainnet.infura.io/v3/{}", infura_key))
+        .map_err(|e| anyhow::anyhow!("Failed to create HTTP provider: {}", e))?;
+    let ws_provider = Provider::<Ws>::connect(format!("wss://mainnet.infura.io/ws/v3/{}", infura_key)).await
+        .map_err(|e| anyhow::anyhow!("Failed to create ws provider: {}", e))?;
+
+    // Set up components
+    let stablecoin_oracle = Arc::new(MockStablecoinOracle);
+    let arbitrage_checker = Arc::new(ArbitrageChecker {
+        uniswap_router: *UNISWAP_V3_ROUTER,
+        sushi_router: *SUSHI_ROUTER,
+        client: Arc::new(http_provider.clone()),
+    });
+    let price_validator = Arc::new(PriceValidator {
+        arbitrage_checker,
+        max_price_deviation: 0.05,
+    });
+
+    let oracle = Arc::new(PriceOracle {
+        providers: HashMap::from([
+            (DexType::UniswapV3, Arc::new(ws_provider.clone())),
+            (DexType::SushiSwap, Arc::new(ws_provider)),
+        ]),
+        price_cache: Arc::new(RwLock::new(HashMap::new())),
+        stablecoin_oracle,
+        validator: price_validator,
+        config: config.clone(),
+    });
+
+    let circuit_breaker = Arc::new(CircuitBreaker {
+        max_daily_loss: 1000.0,
+        max_position_size: U256::from(10).pow(18.into()) * U256::from(10),
+        min_profit_threshold: config.min_profit_threshold,
+        max_concurrent_trades: config.max_concurrent_trades,
+        current_metrics: Arc::new(RwLock::new(TradingMetrics::default())),
+        is_active: Arc::new(RwLock::new(true)),
+    });
+
+    let flash_loan = Arc::new(AaveFlashLoanProvider {
+        client: Arc::new(http_provider.clone()),
+        lending_pool: *AAVE_LENDING_POOL,
+    });
+
+    let mev_protection = Arc::new(MevProtection {
+        max_priority_fee_per_gas: U256::from(2_000_000_000),
+        min_priority_fee_per_gas: U256::from(1_000_000_000),
+        flashbots_enabled: false,
+        private_rpc_url: Some("https://your-private-rpc.com".to_string()),
+    });
+
+    let trade_executor = Arc::new(TradeExecutor {
+        client: Arc::new(http_provider),
+        flash_loan_providers: vec![flash_loan],
+        config: config.clone(),
+        pending_txs: Arc::new(Mutex::new(HashMap::new())),
+        mev_protection: mev_protection.clone(),
+    });
+
+    let engine = Arc::new(ArbitrageEngine {
+        oracle,
+        circuit_breaker,
+        pools: create_sample_pools(), // You'll need to implement this
+        config: config.clone(),
+        trade_executor: trade_executor.clone(),
+        opportunity_queue: Arc::new(Mutex::new(VecDeque::new())),
+        historical_opportunities: Arc::new(RwLock::new(Vec::new())),
+        mev_protection,
+    });
+
+    let health_check = Arc::new(HealthCheck {
+        last_heartbeat: Arc::new(RwLock::new(Instant::now())),
+        max_latency: Duration::from_secs(10),
+    });
+
+    let bot = ArbitrageBot {
+        engine,
+        executor: trade_executor,
+        config,
+        health_check,
+    };
+
+    // Run the bot
+    println!("Starting arbitrage bot...");
+    bot.run().await
+}
+
+// Helper function to create sample pools - you'll need to implement this properly
+fn create_sample_pools() -> Vec<PoolInfo> {
+    // This is a placeholder - you'll need to populate this with real pool data
+    // from the blockchain or a data provider
+    vec![]
+}
+
+// Additional utility functions
+
+impl BotConfig {
+    pub fn new_conservative() -> Self {
+        Self {
+            max_trade_size: U256::from(10).pow(17.into()), // 0.1 ETH
+            min_profit_threshold: 0.5, // 0.5% minimum profit
+            max_slippage: 0.3,
+            max_price_impact: 0.5,
+            gas_price_multiplier: 1.1,
+            max_concurrent_trades: 2,
+            max_trade_retries: 2,
+            max_tx_wait_time: Duration::from_secs(20),
+            flash_loan_fee: 0.0009,
+            profit_estimation_buffer: 0.2,
+        }
+    }
+
+    pub fn new_aggressive() -> Self {
+        Self {
+            max_trade_size: U256::from(10).pow(19.into()), // 10 ETH
+            min_profit_threshold: 0.05, // 0.05% minimum profit
+            max_slippage: 1.0,
+            max_price_impact: 2.0,
+            gas_price_multiplier: 1.5,
+            max_concurrent_trades: 5,
+            max_trade_retries: 5,
+            max_tx_wait_time: Duration::from_secs(45),
+            flash_loan_fee: 0.0009,
+            profit_estimation_buffer: 0.05,
+        }
+    }
+}
+
+impl CircuitBreaker {
+    pub async fn should_halt_trading(&self) -> bool {
+        let metrics = self.current_metrics.read().await;
+        let is_active = *self.is_active.read().await;
+        
+        !is_active || 
+        metrics.daily_pnl < -self.max_daily_loss ||
+        metrics.concurrent_trades >= self.max_concurrent_trades
+    }
+
+    pub async fn record_trade(&self, profit: f64, volume: U256) {
+        let mut metrics = self.current_metrics.write().await;
+        metrics.total_trades += 1;
+        metrics.daily_pnl += profit;
+        metrics.weekly_pnl += profit;
+        metrics.total_volume += volume;
+        
+        if profit > 0.0 {
+            metrics.successful_trades += 1;
+        } else {
+            metrics.failed_trades += 1;
+        }
+    }
+}
+
+// Risk management utilities
+impl ArbitrageOpportunity {
+    pub fn calculate_risk_score(&self) -> f64 {
+        let mut risk = 0.0;
+        
+        // Add risk based on path length
+        risk += (self.path.len() as f64 - 1.0) * 0.1;
+        
+        // Add risk based on expected profit (lower profit = higher risk)
+        if self.expected_profit < 0.1 {
+            risk += 0.3;
+        }
+        
+        // Add risk based on gas cost relative to profit
+        let gas_cost_eth = self.total_gas_cost.as_u128() as f64 / 1e18;
+        if gas_cost_eth > self.expected_profit * 0.5 {
+            risk += 0.4;
+        }
+        
+        risk.min(1.0)
+    }
+    
+    pub fn is_profitable_after_fees(&self, gas_price: U256) -> bool {
+        let gas_cost_eth = (self.total_gas_cost * gas_price).as_u128() as f64 / 1e18;
+        let flash_loan_fee = self.optimal_amount.as_u128() as f64 * 0.0009 / 1e18;
+        let total_fees = gas_cost_eth + flash_loan_fee;
+        
+        self.expected_profit > total_fees
+    }
 }
