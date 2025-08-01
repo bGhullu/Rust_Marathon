@@ -1,5 +1,5 @@
 [package]
-name = "Rust_Marathon"
+name = "rust_marathon"
 version = "0.1.0"
 edition = "2024"
 default-run = "Rust_Marathon"

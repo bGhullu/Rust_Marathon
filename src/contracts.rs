@@ -3,6 +3,42 @@ use ethers::{
     types::{Address, U256},
 };
 use once_cell::sync::Lazy;
+use crate::models::{Pool,Token};
+
+
+pub static WETH: Lazy<Token> = Lazy::new( || {
+    Token::new(
+        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+            .parse()
+            .expect("valid WETH address"),
+        "WETH",
+        18,
+    )
+});
+
+pub static USDC: Lazy<Token> = Lazy::new( || {
+    Token::new(
+    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        .parse()
+        .expect("valid USDC address"),
+    "USDC",
+    6,
+)
+});
+
+
+pub static POOLS: Lazy<Vec<Pool>> = Lazy::new( || {
+    vec![
+        Pool::new(
+            "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
+            .parse()
+            .expect("valid pool address"),
+            WETH.clone(),
+            USDC.clone(),
+            500,
+        ),
+    ]
+});
 
 // Protocol Addresses
 pub static UNISWAP_V3_FACTORY: Lazy<Address> = Lazy::new(|| {
