@@ -2,7 +2,7 @@
 name = "rust_marathon"
 version = "0.1.0"
 edition = "2024"
-default-run = "Rust_Marathon"
+default-run = "rust_marathon"
 
 [dependencies]
 
@@ -31,6 +31,6 @@ tracing-subscriber = "0.3"
 dotenv = "0.15" # Environment variables
 primitive-types = {version="0.12", features = ["serde"]}
 reqwest = { version = "0.11", features = ["json"] }
-
+dashmap = "5"
 uuid = { version = "1.0", features = ["v4"] }
 tokio-test = "0.4"
