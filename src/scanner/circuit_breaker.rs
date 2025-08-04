@@ -1,4 +1,10 @@
 
+use tokio::sync::Mutex;
+use std::{
+    sync::atomic::{AtomicUsize,AtomicBool,Ordering},
+    time::{Duration,Instant},
+};
+
 pub struct CircuitBreaker {
     error_count: AtomicUsize,
     circuit_breaker_threshold: usize,
@@ -11,7 +17,7 @@ impl CircuitBreaker {
     pub fn new(max_errors: usize, cool_down: Duration, auto_reset: bool) -> Self {
         Self {
             error_count: AtomicUsize::new(0),
-            max_errors,
+            circuit_breaker_threshold: max_errors,
             cool_down,
             last_tripped: Mutex::new(None),
             auto_reset: AtomicBool::new(auto_reset),
@@ -22,7 +28,7 @@ impl CircuitBreaker {
 
     pub async fn is_tripped(&self) -> bool {
         let count = self.error_count.load(Ordering::Relaxed);
-        if count < self.max_errors {
+        if count < self.circuit_breaker_threshold {
             return false;
         }
 
@@ -41,7 +47,7 @@ impl CircuitBreaker {
 
     pub async fn trip(&self) {
         let new_count = self.error_count.fetch_add(1, Ordering::Relaxed) +1;
-        if new_count >= self.max_errors {
+        if new_count >= self.circuit_breaker_threshold{
             let mut guard = self.last_tripped.lock().await;
             *guard = Some(Instant::now());
         }
@@ -53,7 +59,7 @@ impl CircuitBreaker {
         *guard = None;
     }
 
-    pub fn error_count(&self) -> useize {
+    pub fn error_count(&self) -> usize {
         self.error_count.load(Ordering::Relaxed)
     }
 }

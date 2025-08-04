@@ -1,10 +1,10 @@
+
 mod config;
+mod scanner; 
 
 use config::ScannerConfig;
 use anyhow::Result;
 use dotenv::dotenv;
-use std::sync::Arc;
-use tokio::time::{sleep, Duration};
 
 #[tokio::main]
 async fn main () -> Result<()>{
@@ -14,9 +14,7 @@ async fn main () -> Result<()>{
    
     // Load configuration
     dotenv().ok();
-    let config = BotConfig::from_env()?;
-
-
+    let config = ScannerConfig::from_env()?;
 
     Ok(())
 
