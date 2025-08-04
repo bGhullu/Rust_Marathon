@@ -17,7 +17,7 @@ use ethers::{
     types::{Address,Block,H256,Transaction,Log, U256},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Context};
 use tracing::{info,debug,warn,error};
 
 
@@ -28,6 +28,7 @@ use crate::{
     providers::ProviderManager,
     cache::StateCache,
     config::ScannerConfig,
+    const_and_addr,
 }; 
 use super::{BloomFilter, CircuitBreaker};
 
@@ -97,7 +98,6 @@ impl ConnectionState {
             ws_connected: false,
             consecutive_errors: 0,
             last_success: Instant::now(),
-
             reconnect_attempts:0,
         }
     }
@@ -106,20 +106,19 @@ impl ConnectionState {
 impl MevScanner {
     /// Creates a new MEV scanner with the given configuration
     pub async fn new(config: ScannerConfig) -> Result<Self> {
-
-        // Extract endpoints using config
-        let ws_endpoing = config.primary_provider.clone()
-            .ok_or_else(|| anyhow!("WebSocket URL required in config!!!!"))?;
-        let http_endpoint = config.fallback_provider.clone();
+   
+        let ws_endpoint = config.primary_rpc_url();
+            
+        let http_endpoint = config.fallback_rpc_url();
 
         // Initialize HTTP provider (always available)
         let fallback_provider = Arc::new(
-            Provider::<Http>::try_from(&http_endpoint)
+            Provider::<Http>::try_from(http_endpoint)
                 .context("Failed to create HTTP provider")?
         );
 
         // Try to initalize WebSocket provider
-        let primary_provider = match Provider::<Ws>::connect(&ws_endpoint).await{
+        let primary_provider = match Provider::<Ws>::connect(ws_endpoint).await{
             Ok(ws_provider) => {
                 info!("✅ WebSocket provider connected successfully......");
                 Arc::new(Mutex::new(Arc::new(ws_provider)))
@@ -127,43 +126,42 @@ impl MevScanner {
             Err(e) => {
                 warn!("⚠️ WebSocket connection failed, will retry: {}", e);
                 // Create a placeholder - will be replaced on reconnect
-                let dummy_ws =  create_dummy_ws_provider().await?;
+                let dummy_ws =  create_dummy_ws_provider().await?; // ------------------------------------------------------
                 Arc::new(Mutex::new(Arc::new(dummy_ws)))
             }
         };
 
         let provider_manager = ProviderManager::new(
-            &config.primary_rpc_url,
-            &config.fallback_rpc_url,
+            ws_endpoint,
+            http_endpoint,
         ).await?;
 
-        let ws_endpoint = &config.primary_rpc_url;
+        let ws_endpoint = &config.primary_rpc_url();
 
         let pool_manager = PoolManger::new();
-        let arbitrage_detector = ArbitrageDetector::new(config.min_profit_threshold);
+        let arbitrage_detector = ArbitrageDetector::new(config.min_profit_threshold());
 
-        let mempool_watcher = if let Some(ws_url) = &config.primary_rpc_url {
-            let mut watcher = MempoolWatcher::new();
-            watcher.initialize(ws_url).await?;
-            Arc::new(Mutex::new(watcher))
-        } else {
-            Arc::new(Mutex::new(MempoolWatcher::new()))
-        };
+        
+        let mempool_watcher = Arc::new(
+            Mutex::new(MempoolWatcher::new(ws_endpoint).await?
+        ));
+       
 
         let state_cache = StateCache::new(
-            config.cache_capacity,
-            Duration::from_secs(config.cache_ttl_seconds),
+            const_and_addr::DEFAULT_CACHE_SIZE,
+            Duration::from_secs(const_and_addr::DEFAULT_CACHE_TTL_SECONDS),
         );
 
-        let slot_cache = SlotCache::new(SLOT_CACHE_SIZE);
+        let slot_cache = SlotCache::new(const_and_addr::SLOT_CACHE_SIZE);
 
-        let circut_breaker = CircuitBreaker::new(
-            config.circuit_breaker_threshold,
-            Duration::from_secs(config.circuit_breaker_cooldown_seconds),
+        let circuit_breaker = CircuitBreaker::new(
+            const_and_addr::CIRCUIT_BREAKER_THRESHOLD,
+            const_and_addr::COOL_DOWN_PERIOD,
+            true,
         );
-
+        let ws_url = ws_endpoint.to_string();
         Ok(Self {
-            ws_endpoint,
+            ws_endpoint: ws_url,
             primary_provider,
             fallback_provider,
             provider_manager,
@@ -172,9 +170,9 @@ impl MevScanner {
             mempool_watcher,
             state_cache,
             slot_cache,
-            circut_breaker,
+            circuit_breaker,
             config,
-            last_block: Mutex::new(0),
+            last_block: AtomicU64::new(0),
             connection_state: Arc::new(Mutex::new(ConnectionState::default())),
             ws_reconnected: Arc::new(Notify::new()),
         })
@@ -185,7 +183,7 @@ impl MevScanner {
     pub async fn run_cycle(
         &self, 
         mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-    ) -> Result<Vec<ArbitrageOpporutnity>, ScannerError> {
+    ) -> Result<Vec<ArbitrageOpporutnity>> {
         info!("Starting MEV Scanner main loop .................");
 
         // Start mempool monitoring task 
@@ -195,13 +193,13 @@ impl MevScanner {
             tokio::select!{
                 _ = shutdown_rx.recv() => {
                     info!("🛑 Shutdown signal received. Exiting run cycle loop....");
-                    mempool_taks.abort();
+                    mempool_task.abort();
                     break Ok(());
                 }
                 _ = async {
                     if self.circuit_breaker.is_tripped().await {
                         warn!("⚠️ Circuit breaker tripped, cooling down.....");
-                        sleep(self.circuit_breaker.cool_down).await;
+                        sleep(const_and_addr::COOL_DOWN_PERIOD).await;
                         return;
                     }
                     if self.connection_state.lock().await.ws_connected{
@@ -227,7 +225,7 @@ impl MevScanner {
                             }
                             Err(e) => {
                                 error! ("HTTP process error: {:?}", e);
-                                self.circut_breaker.trip().await;
+                                self.circuit_breaker.trip().await;
                                 sleep(RECONNECT_DELAY).await;
                             }
                         }
@@ -247,7 +245,7 @@ impl MevScanner {
             loop {
                 if let Ok(mut watcher) = mempool_watcher.try_lock() {
                     if let Ok(pending_txs) = watcher.get_pending_transactions().await {
-                        for tx in pendint_txs {
+                        for tx in pending_txs {
                             if let Ok(opportunities) = arbitrage_detector.analyze_transaction(&tx).await {
                                 info!("📊 Mempool arbitrage opportunity")
                                 self.handle_opportunities(opportunities).await;
@@ -259,8 +257,8 @@ impl MevScanner {
         })
     }
 
-    pub async fn process_ws_blocks(&self) -> Resutl<()> {
-        let provider = self.primary_provider.lock().clone();
+    pub async fn process_ws_blocks(&self) -> Result<()> {
+        let provider = self.primary_provider.lock().await.clone();
         let mut stream = provider
             .subscribe_blocks()
             .await
@@ -284,32 +282,32 @@ impl MevScanner {
         Err(anyhow!("WebSocket stream terminated"))
     }
 
-    async fn process_http_polling(&self) -> Resutl<()> {
+    async fn process_http_polling(&self) -> Result<()> {
         info!("📊 Falling back to HTTP polling mode");
+
         loop {  
             tokio::select!{
-                _ = sleep(HTTP_POLL_INTERVAL).await;
-                let latest_block = self.fallback_provider.get_block_number().await?.as_u64();
-                let last_processed = self.last_block.load(Ordering::Relaxed);
+                _ = sleep(HTTP_POLL_INTERVAL) => {
+                    let latest_block = self.fallback_provider.get_block_number().await?.as_u64();
+                    let last_processed = self.last_block.load(Ordering::Relaxed);
 
-                if lastest_block > last_processed {
-                    // Process all missed blocks individually for maximum speed 
-                    for block_num in (last_processed+1..=lastest_block) {
-                        if let Err(e) = self.process_single_block_by_number(block_number).await {
-                            error!("HTTP block {} processing failed: {:?}", block_num, e);
-                            continue;
+                    if latest_block > last_processed {
+                        // Process all missed blocks individually for maximum speed 
+                        for block_num in (last_processed+1..=latest_block) {
+                            if let Err(e) = self.process_single_block_by_number(block_num).await {
+                                error!("HTTP block {} processing failed: {:?}", block_num, e);
+                                continue;
+                            }
+                            self.last_block.store(block_num, Ordering::Relaxed);
                         }
-                        self.last_block.store(block_num, Ordering::Relaxed);
                     }
-                }
-
-                // Try to reconnect WebSocket periodically
-                if self.should_attempt_ws_reconnect().await {
-                    info!("🔃 Time to attempt WebSocket reconnect, exiting HTTP fallback");
-                    break; // Exit HTTP polling to retry Websocket
-                }
-
-                _ = self.ws_connected.notified() = {
+                    // Try to reconnect WebSocket periodically
+                    if self.should_attempt_ws_reconnect().await {
+                        info!("🔃 Time to attempt WebSocket reconnect, exiting HTTP fallback");
+                        break; // Exit HTTP polling to retry Websocket
+                    }
+                },
+                _ = self.ws_reconnected.notified() => {
                     info!("✅ WebSocket reconnected, exiting HTTP fallback");
                    
                 }
@@ -321,9 +319,9 @@ impl MevScanner {
       
     }
 
-    async fn process_block_immediately(&self, block: Block<H256>) -> Resutl<()>{
+    async fn process_block_immediately(&self, block: Block<H256>) -> Result<()>{
         let start_time = Instant::now();
-        if let Some(number) = block.number.map(|n| n.as_u64) {
+        if let Some(number) = block.number.map(|n| n.as_u64()) {
             debug!("⚡️ Processing block {} immediately", number);
 
             match timeout(BLOCK_PROCESSING_TIMEOUT, self.process_single_block(number)).await {
@@ -347,16 +345,16 @@ impl MevScanner {
         Ok(())
     }
 
-    async fn process_single_block_by_number(number: u64) -> Result<Vec<ArbitrageOpportunity>> {
+    async fn process_single_block_by_number(&self, number: u64) -> Result<Vec<ArbitrageOpportunity>> {
         let block = self.fallback_provider
-            .get_block_with_txs(number)
+            .get_block(number)
             .await?
-            .ok_or_else(|| anyhow!("Block {} not found", block_number))?;
+            .ok_or_else(|| anyhow!("Block {} not found", number))?;
         self.process_single_block(block).await
     }
 
 
-    async fn process_single_block(&self, block: Block<H256>) -> Resutl<Vec<ArbitrageOpportunity>> {
+    async fn process_single_block(&self, block: Block<H256>) -> Result<Vec<ArbitrageOpportunity>> {
         let block_number = block.number
             .ok_or_else(|| anyhow!("Block missing number!!!!"))?
             .as_u64();
@@ -389,6 +387,9 @@ impl MevScanner {
         Ok(opportunities)
     }
 
+    async fn detect_changed_slots(&self, block: &Block<H256>) -> Result<Vec<u64,U256>> {
+
+    }
 
       /// Adds pools to monitor for arbitrage opportunities 
     pub async fn add_pools(&self, pools: Vec<(Address, Address,Address)>) -> Result<(), ScannerError> {

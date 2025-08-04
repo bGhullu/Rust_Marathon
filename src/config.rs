@@ -5,9 +5,10 @@ use std::{
     str::FromStr,
 };
 
+use crate::make_getters;
+use crate::const_addr;
 
-const COOL_DOWN_PERIOD: Duration = Duration::from_secs(60);
-const CIRCUIT_BREAKER_THRESHOLD : usize = 5;
+
 
 #[derive(Debug, Clone)]
 pub struct ScannerConfig {
@@ -17,13 +18,13 @@ pub struct ScannerConfig {
     min_profit_threshold: f64,
     max_slippage: f64,
     private_key: String,
-    circuit_break_threshold: usize,
+    circuit_breaker_threshold: usize,
     circuit_breaker_cooldown_seconds: Duration,
 }
 
 
 
-fn prase_env_var<T>(key: &str, default: T) -> T 
+fn parse_env_var<T>(key: &str, default: T) -> T 
 where 
     T: FromStr,
 {
@@ -35,8 +36,24 @@ where
 }
 
 impl ScannerConfig {
+
+    make_getters!(
+        ref: 
+            (primary_rpc_url: String),
+            (fallback_rpc_url: String),
+            (max_trade_size: U256),
+            (private_key: String),
+            (circuit_breaker_cooldown_seconds: Duration),
+    );
+
+    make_getters!(
+        copy:
+            (min_profit_threshold: f64),
+            (max_slippage: f64),
+            (circuit_breaker_threshold: usize),
+    );
     pub fn from_env() -> Result<Self> {
-        let _ = dotenv::dotenv();
+        dotenv::dotenv();
         let primary_rpc_url = std::env::var("WS_URL")
             .context("Missing WS_URL in enviornment")?;
         let fallback_rpc_url= std::env::var("HTTP_URL")
@@ -53,17 +70,19 @@ impl ScannerConfig {
         if private_key.is_empty(){
             return Err(anyhow!("PRIVATE_KEY cannot be empty"));
         }
+        let max_trade_size = std::env::var("MAX_TRADE_SIZE")
+                .ok()
+                .and_then(|s| U256::from_dec_str(&s).ok())
+                .unwrap_or_else(|| U256::exp10(18));
 
         Ok(Self { 
-           primary_rpc_url,
-           fallback_rpc_url,
-            max_trade_size: std::env::var("MAX_TRADE_SIZE")
-                .map(|s| U256::from_dec_str(&s).unwrap_or(U256::from(10).pow(U256::from(18u64))))
-                .unwrap_or(U256::from(10).pow(U256::from(18u64))),
-            min_profit_threshold: prase_env_var("MIN_PROFIT_THRESHOLD", 0.001),
-            max_slippage: prase_env_var("MAX_SLIPPAGE", 0.005),
-            circuit_breaker_cooldown_seconds: COOL_DOWN_PERIOD,
-            circuit_break_threshold: CIRCUIT_BREAKER_THRESHOLD,
+            primary_rpc_url,
+            fallback_rpc_url,
+            max_trade_size,
+            min_profit_threshold: parse_env_var("MIN_PROFIT_THRESHOLD", 0.001),
+            max_slippage: parse_env_var("MAX_SLIPPAGE", 0.005),
+            circuit_breaker_cooldown_seconds: const_addr::COOL_DOWN_PERIOD,
+            circuit_breaker_threshold: const_addr::CIRCUIT_BREAKER_THRESHOLD,
             private_key,
 
         })
