@@ -10,25 +10,21 @@ use std::{
 };
 use tokio::{
     time::{sleep, timeout},
-    sync::{Notify, Mutex},
+    sync::{Notify, Mutex,Semaphore},
 };
 use ethers::{
-    providers::{Provider, Ws,Http, Middleware, StreamExt},
-    types::{Address,Block,H256,Transaction,Log, U256},
+    providers::{Http, Middleware, Provider, StreamExt, Ws},
+    types::{transaction, Address, Block, Log, Transaction, H256, U256},
 };
-
+use futures::stream;
 use anyhow::{anyhow, Result, Context};
 use tracing::{info,debug,warn,error};
+use once_cell::sync::Lazy;
+
 
 
 use crate::{
-    pools::{PoolManger, PoolState},
-    arbitrage::{ArbitrageDetector, ArbitrageOpporutnity},
-    mempool::MempoolWatcher,
-    providers::ProviderManager,
-    cache::StateCache,
-    config::ScannerConfig,
-    const_and_addr,
+    arbitrage::{ArbitrageDetector, ArbitrageOpporutnity}, cache::StateCache, config::ScannerConfig, const_and_addr::{self, MAX_RECEIPT_CONCURRENCY}, mempool::MempoolWatcher, pools::{PoolManger, PoolState}, providers::ProviderManager
 }; 
 use super::{BloomFilter, CircuitBreaker};
 
@@ -293,7 +289,7 @@ impl MevScanner {
 
                     if latest_block > last_processed {
                         // Process all missed blocks individually for maximum speed 
-                        for block_num in (last_processed+1..=latest_block) {
+                        for block_num in last_processed+1..=latest_block {
                             if let Err(e) = self.process_single_block_by_number(block_num).await {
                                 error!("HTTP block {} processing failed: {:?}", block_num, e);
                                 continue;
@@ -387,8 +383,42 @@ impl MevScanner {
         Ok(opportunities)
     }
 
-    async fn detect_changed_slots(&self, block: &Block<H256>) -> Result<Vec<u64,U256>> {
+    async fn detect_changed_slots(&self, block: &Block<H256>) -> Result<Vec<(u64,U256)>> {
+        // Global RPC limiter (protects node from overload)
+        let provider = self.primary_provider.lock().await.clone();
+        static RPC_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(const_and_addr::MAX_RPC_INFLIGHT));
+        let receipts = stream::iter(&block.transactions)
+            .map(|tx_hash| async move {
+                let _permit = RPC_SEMAPHORE.acquire().await; // Global rate limiting
+                provider
+                    .get_transaction_receipt(*tx_hash)
+                    .await
+                    .ok()
+                    .flatten()
+            })
+            .buffered(MAX_RECEIPT_CONCURRENCY);
+        let changed_slots = receipts
+            .filter_map(|receipt| async move{
+                let to = receipt.to?;
+                if !self.pool_manager.is_monitored_pool(to).await {
+                    return None;
+                }
+                Some(
+                    stream::iter(receipt.logs)
+                    .map(|log| async move {
+                        self.parse_log_for_storage_changes(log).await.ok()
+                    }) 
+                    .buffer_unordered(const_and_addr::MAX_LOG_CONCURRENCY)
+                    .filter_map(|x|x)
+                    .collect::<Vec<_>>()
+                    .await
+                )
+            })
+            .flat_map(stream::iter)
+            .collect::<Vec<_>>()
+            .await;
 
+        Ok(changed_slots)
     }
 
       /// Adds pools to monitor for arbitrage opportunities 
