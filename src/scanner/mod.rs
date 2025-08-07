@@ -10,3 +10,4 @@ mod circuit_breaker;
 pub use core::MevScanner;
 pub use bloom_filter::BloomFilter;
 pub use circuit_breaker::CircuitBreaker;
+

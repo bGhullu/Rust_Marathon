@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::make_getters;
-use crate::const_addr;
+use crate::const_and_addr;
 
 
 
@@ -81,8 +81,8 @@ impl ScannerConfig {
             max_trade_size,
             min_profit_threshold: parse_env_var("MIN_PROFIT_THRESHOLD", 0.001),
             max_slippage: parse_env_var("MAX_SLIPPAGE", 0.005),
-            circuit_breaker_cooldown_seconds: const_addr::COOL_DOWN_PERIOD,
-            circuit_breaker_threshold: const_addr::CIRCUIT_BREAKER_THRESHOLD,
+            circuit_breaker_cooldown_seconds: const_and_addr::COOL_DOWN_PERIOD,
+            circuit_breaker_threshold: const_and_addr::CIRCUIT_BREAKER_THRESHOLD,
             private_key,
 
         })

@@ -4,7 +4,6 @@
 //! by monitoring blockchain state changes and anaylyzing price differences.
 
 use std::{
-    collections::HashMap,
     sync::{Arc, atomic::{AtomicU64, Ordering}}, 
     time::{Duration, Instant},
 };
@@ -14,9 +13,9 @@ use tokio::{
 };
 use ethers::{
     providers::{Http, Middleware, Provider, StreamExt, Ws},
-    types::{transaction, Address, Block, Log, Transaction, H256, U256},
+    types::{transaction, Address, Block, Log, Transaction, TransactionReceipt, H256, U256},
 };
-use futures::stream;
+use futures::stream::{self, StreamExt as FuturesStreamExt};
 use anyhow::{anyhow, Result, Context};
 use tracing::{info,debug,warn,error};
 use once_cell::sync::Lazy;
@@ -321,7 +320,7 @@ impl MevScanner {
             debug!("⚡️ Processing block {} immediately", number);
 
             match timeout(BLOCK_PROCESSING_TIMEOUT, self.process_single_block(number)).await {
-                Ok(OK(opportunities)) => {
+                Ok(Ok(opportunities)) => {
                     if !opportunities.is_emppty() {
                         info!("💰 Found {} MEV opportunities in block {} ({}ms)",opportunities.len(), number, start_time.elapsed().as_millis());
                         self.handle_opportunities(opportunities).await;
@@ -372,9 +371,9 @@ impl MevScanner {
         let mut opportunities = self.find_arbitrage(modified_pools).await?;
         
         // 5. Analyze individual transactions for MEV opportunities
-        if let Some(transactions) = &block.transaction {
+        if let Some(transactions) = &block.transactions {
             for tx in transactions {
-                if let Ok(tx_transaction) = self.analyze_transaction_for_mev(tx).await {
+                if let Ok(tx_opportunities) = self.analyze_transaction_for_mev(tx).await {
                     opportunities.extend(tx_opportunities);
                 }
             }
@@ -383,46 +382,77 @@ impl MevScanner {
         Ok(opportunities)
     }
 
-    async fn detect_changed_slots(&self, block: &Block<H256>) -> Result<Vec<(u64,U256)>> {
-        // Global RPC limiter (protects node from overload)
-        let provider = self.primary_provider.lock().await.clone();
+  async fn detect_changed_slots(&self, block: &Block<H256>) -> Result<Vec<(u64, U256)>> {
         static RPC_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(const_and_addr::MAX_RPC_INFLIGHT));
-        let receipts = stream::iter(&block.transactions)
-            .map(|tx_hash| async move {
-                let _permit = RPC_SEMAPHORE.acquire().await; // Global rate limiting
-                provider
-                    .get_transaction_receipt(*tx_hash)
-                    .await
-                    .ok()
-                    .flatten()
-            })
-            .buffered(MAX_RECEIPT_CONCURRENCY);
-        let changed_slots = receipts
-            .filter_map(|receipt| async move{
-                let to = receipt.to?;
-                if !self.pool_manager.is_monitored_pool(to).await {
-                    return None;
+        let provider = self.primary_provider.lock().await.clone();
+        
+        // 1. Fetch receipts with concurrency control
+        let receipts: Vec<TransactionReceipt> = stream::iter(&block.transactions)
+            .map(|tx_hash| {
+                let provider = provider.clone();
+                async move {
+                    let _permit = RPC_SEMAPHORE.acquire().await.unwrap();
+                    provider
+                        .get_transaction_receipt(*tx_hash)
+                        .await
+                        .ok()
+                        .flatten()
                 }
-                Some(
-                    stream::iter(receipt.logs)
-                    .map(|log| async move {
-                        self.parse_log_for_storage_changes(log).await.ok()
-                    }) 
-                    .buffer_unordered(const_and_addr::MAX_LOG_CONCURRENCY)
-                    .filter_map(|x|x)
-                    .collect::<Vec<_>>()
-                    .await
-                )
             })
-            .flat_map(stream::iter)
-            .collect::<Vec<_>>()
+            .buffered(const_and_addr::MAX_RECEIPT_CONCURRENCY)
+            .filter_map(|x| async move { x })
+            .collect()
             .await;
 
-        Ok(changed_slots)
+        // 2. Process receipts and logs
+        let mut all_changed_slots = Vec::new();
+        
+        for receipt in receipts {
+            let to = receipt.to else { continue };  
+            if !self.pool_manager.is_monitored_pool(to).await {
+                continue;
+            }
+            
+            // Process logs for this receipt
+            let log_results: Vec<(u64, U256)> = stream::iter(receipt.logs)
+                .map(|log| async move {
+                    self.parse_log_for_storage_changes(&log).await.unwrap_or_default()
+                })
+                .buffered(const_and_addr::MAX_LOG_CONCURRENCY)
+                .flat_map(|changes| stream::iter(changes))
+                .collect()
+                .await;
+            
+            // Flatten and add to results
+            all_changed_slots.extend(log_results);
+        }
+
+        Ok(all_changed_slots)
+    } 
+
+    async fn parse_log_for_storage_changes(&self, log: &Log) -> Result<Vec<(u64, U256)>> {
+        let mut changes = Vec::new();
+
+        // Uniswap V2 Sync event: topic0 =  keccak256("Sync(uint112,uint112)")
+        let sync_topic = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
+
+        if log.topics.len() > 0 && format!("{:#x}", log.topics[0]) == sync_topic {
+            // Parse reserve data from Sync event
+            if log.data.len() >= 64 {
+                let reserve0 = U256::from_big_endian(&log.data[0..32]);
+                let reserve1 = U256::from_big_endian(&log.data[32..64]);
+
+                // Map to storage slots (simplified - actual slots depend on contract layout)
+                changes.push((8, reserve0)); // Slot 8: reserve0
+                changes.push((9, reserve1)); // SLot 9: reserve1
+
+            }
+        }
+        Ok(changes)
     }
 
       /// Adds pools to monitor for arbitrage opportunities 
-    pub async fn add_pools(&self, pools: Vec<(Address, Address,Address)>) -> Result<(), ScannerError> {
+    pub async fn add_pools(&self, pools: Vec<(Address, Address,Address)>) -> Result<()> {
         self.pool_manager.add_pools(pools).await?;
 
         // Also add to mempool watcher

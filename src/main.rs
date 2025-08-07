@@ -2,7 +2,7 @@
 mod config;
 mod scanner;
 mod macros; 
-mod const_addr;
+mod const_and_addr;
 
 use config::ScannerConfig;
 use anyhow::Result;
