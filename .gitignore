@@ -1,10 +1,11 @@
 /target
 .vscode
 .env
-note.md
+notes.md
 test.rs
 test1.rs
 test2.rs
 test3.rs
 flowchart.md
+drift_detect.rs
 /bin/
