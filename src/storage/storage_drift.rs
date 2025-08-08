@@ -224,7 +224,7 @@ pub enum ContractType {
 }
 
 pub struct SimpleStateCache  {
-    slot_value: Arc<RwLock<HashMap<(Address, SlotKey), Vec<H256>>>>,
+    slot_values: Arc<RwLock<HashMap<(Address, SlotKey), Vec<H256>>>>,
 }
 
 
@@ -232,13 +232,13 @@ pub struct SimpleStateCache  {
 impl SimpleStateCache {
     pub fn new() -> Self {
         Self{
-            slot_value:  Arc::new(RwLock::new(HashMap::new())),
+            slot_values:  Arc::new(RwLock::new(HashMap::new())),
 
         }
     }
 
     pub async fn store_slot_value(&self, contract: Address, slot: SlotKey, value: H256) {
-        let mut cache = self.slot_value.write().await;
+        let mut cache = self.slot_values.write().await;
         cache.entry((contract, slot)).or_default().push(value);
 
     // Keep only last 100 values per slot
@@ -250,12 +250,12 @@ impl SimpleStateCache {
     }
 
     pub async fn get_slot_history(&self, contract: Address, slot: SlotKey) -> Vec<H256> {
-        let cache = self.slot_value.read().await;
+        let cache = self.slot_values.read().await;
         cache.get(&(contract, slot)).cloned().unwrap_or_default()
     }
 
     pub async fn get_latest_value(&self, contract: Address, slot: SlotKey) -> Option<H256> {
-        let cache = self.slot_value.read().await;
+        let cache = self.slot_values.read().await;
         cache.get(&(contract,slot))?.last().cloned()
     }
 }
@@ -396,6 +396,85 @@ impl StorageDriftDetector {
         }
 
         Ok(deltas)
+    }
+
+    /// Handle Uniswap Swap events
+    async fn handle_swap_event(&self, log:&Log, layout:&StorageLayout, block_number: u64, contract: Address) -> Result<Vec<StorageDelta>>{
+        let mut deltas = Vec::new();
+
+        if log.data.len >= 128 { // 4 uint256 values
+            let amount0_in = U256::from_big_endian(&log.data[0..32]);
+            let amount1_in = U256::from_big_endian(&log.data[32..64]);
+            let amount0_out = U256::from_big_endian(&log.data[64..96]);
+            let amount1_out = U256::from_big_endian(&log.data[96..128]);  
+        }
+
+        // Update reserve slots (typically slot 8 and 9 for Uniswap V2)
+        for reserve_slot in [8u64, 9u64] {
+            if let Some(slot_info) = layout.slots.get(&reserve_slot) {
+               if slot_info.semantic_meaning == SlotSemantic::Reserve {
+                    if let Some(old_reserve) = self.cache.get_latest_value(contract, SlotKey::Resevers(reserve_slot)).await{
+                        let (delta_in, delta_out) = if reserve_slot == 8 {
+                            (amount0_in, amount0_out)
+                        } else {
+                            (amount1_in, amount1_out)
+                        };
+
+                        let old_reserve_u256 = U256::from(old_reserve);
+                        let new_reserve = old_reserve_u256.saturating_add(delt_in).saturating_sub(delta_out);
+
+                        deltas.push(StorageDelta {
+                            slot_key: SlotKey::Reserves(reserve_slot),
+                            old_value: old_reserve,
+                            new_value:  H256::from(new_reserve),
+                            change_type: StorageChangeType::DirectWire,
+                            impact_score: self.calculate_reserve_impact(old_reserve_u256, new_reserve),
+                            confidence: 0.98,
+                            block_number,
+                            contract,
+                        });
+                    }
+
+               } 
+            }
+        }
+
+        Ok(deltas)
+    }
+
+    /// Handle Uniswap Sync events (contains current reserves)
+    async fn sync_event(&self, log:&Log, layout: &StorageLayout, block_number: u64, contract: Address) -> Result<Vec<StorageDelta>> {
+        let mut deltas = Vec::new();
+
+        if log.data.len() >=64 { // 2 uint112 value (padded to 32 bytes each)
+            let reserve0 = U256::from_big_endian(&log.data[0..32]);
+            let reserve1 = U256::from_big_endian(&log.data[32..64]);
+
+            let reserve = [reserve0, reserve1];
+            for (i, reserve_slot) in [8u64, 9u64].iter().enumerate() {
+                if let Some(old_reserve) = self.cache.get_lastest_value(contract, SlotKey::Reserve(*reserve_slot)).await {
+                    let new_reserve = H256::from(reserve[i]);
+                    if old_reserve != new_reserve {
+                        deltas.push(StorageDelt {
+                            slot_key: SlotKey::Reserves(*reserve_slot),
+                            old_value: old_reserve,
+                            new_value: new_reserve,
+                            change_type: StorageChangeType::DirectWrite,
+                            impact_score: self.calculate_reserve_impact(U256::from(old_reserve), reserves[i]),
+                            confidence: 0.99, // Very high confidence for Sync events
+                            block_number,
+                            contract,
+                        });
+                    }
+                };
+            }
+        }
+        Ok(deltas)
+    }
+
+    async fn handle_unknown_event(&self, log: &Log, layout: &StorageLayout, block_number:u64, contract: Address) -> Result<Vec<StorageDelta>> {
+        // For MVP, we just return empty - could implement heuristic analysis here
+        Ok(Vev::new())
     }
 
 
