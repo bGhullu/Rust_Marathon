@@ -477,5 +477,279 @@ impl StorageDriftDetector {
         Ok(Vev::new())
     }
 
+    /// Detect drift events from storage changes
+    async fn detect_drift_events(&self, deltas: &[StorageDelta], block_number: u64) -> Result<Vec<SlotDriftEvent>> {
+        let mut drift_events = Vec::new();
 
+        // Group deltas by contract and slot
+        let mut grouped_changes: HashMap<(Address, SlotKey), Vec<&StorageDelta>> = HashMap::new();
+        for delta in deltas {
+            grouped_changes.entry((delta.contract, delta.slot_key.clone())).or_default().push(delta);
+        }
+        for ((contract, slot_key), changes) in grouped_changes {
+        // Check for drit indicators 
+        let drift_score = self.calculate_drift_score(&changes, contract, slot_key.clone()).await;
+
+        if drift_score > self.anomaly_thresold {
+            // Predict future value
+            let predict_value = self.predict_future_value(contract, slot_key.clone()).await;
+            let current_value = changes.last().unwarp().new_value;
+
+            drift_events.puhs(SlotDriftEvent {
+                chain: "ethereum".to_string(),
+                contract,
+                slot_key,
+                current_value,
+                predicted_value,
+                current_block: block_number,
+                predicted_block: block_number + 10, //Predict 10 blocks ahead
+                timestamp:  Utc::now(),
+                confidence: drift_score,
+            });
+        }
+        }
+
+        Ok(drift_events)
+    } 
+
+    /// Calculate drift score for a set of changes
+    async fn calculate_drift_score(&self, changes: &[StorageDelta], contract: Address, slot_key: SlotKey) -> f64 {
+        if changes.is_empty() {
+           return 0.0; 
+        }
+
+        let mut score = 0.0;
+        
+        // Factor 1:  Number of rapid changes
+        if changes.len() > 3 {
+            score +=0.3;
+        }
+
+        // Factor 2: Average impact score
+        let avg_impact:  f64 = changes.iter().map(|c| c.impact.score).sum::<f64>() / changes.len() as f64;
+        score += ave_impact * 0.4;
+
+        // Factor 3: Volatility based on historical data
+        let history = self.cache.get_slot_history(contract, slot_key).await;
+        if history.len() > 10 {
+            let volatility = self.calculate_volatility(&history);
+            score += volatility * 0.3;
+        }
+
+        score.min(1.0)
+    }
+
+    /// Simple Volatility calculation
+    fn calculate_valatility(&self, values: &[H256]) -> f64 {
+        if values.len() < 2 {
+            return 0.0;
+        }
+
+        let numeric_values: Vec<f64> = values.iter().map(|h| h.low_u64() as f64).collect();
+        let mean = numeric_values.iter().sum::<f64>() / numeric_value.len() as f64;
+
+        let variance = num_value.iter()
+            .map(|&x| (x-mean).powi(2))
+            .sum::<f64>() / numeric_value.len() as f64;
+        
+        (variance.sqrt()/ mean.max(1.0))
+
+    } 
+
+    /// Predict future value using simple trend analysis 
+    async fn predict_future_value(&self, contract: Address, slot_key: SlotKey) -> H256 {
+        let history = self.cache.get_slot_history(contract, slot_key).await;
+
+        if history.len() < 3{
+            return history.last().cloned().unwrap_or(H256::zero());
+        }
+
+        // Simple linear trend predition
+        let recent_values: Vec<f64> = history.iter()
+            .rev()
+            .take(10)
+            .map(|h| h.low_u64() as f64)
+            .collect();
+        
+        if recent_values.len() < 2 {
+            return H256::from_low_u64_be(recent_values[0] as u64);
+        }
+
+        // Calculate trend 
+        let trend = recent_values[0] - recent_values[recent_values.len() - 1 ];
+        let  predicted_value = recent_values[0] + trend * 0.1;
+
+        H256::from_low_u64_be(predicted_value.max(0.0) as u64)
+    }
+
+    /// Update cache with new storage deltas
+    async fn update_cache(&self, deltas: &[StorageDelta]) {
+        for delta in deltas {
+            slot.cache.store_slot_value(delta.contract, delta.slot_key.clone(),  delta.new_value).await;
+        }
+    }
+
+    /// Store drift events in history
+    async fn store_drift_events(&self, block_number: u64, events: &[SlotDriftEvent]) {
+        let mut history = self.drift_history.write().await;
+        history.insert(block_number, events.to.vec());
+
+        // Keep only last 1000 blocks
+        if history.len> 1000 {
+            let cutoff = block_number.saturating_sub(1000);
+            history.retian(|&k, _| k > cutoff);
+        }
+    }
+
+    /// Get storage layout for a contract (simmplied)
+    async fn get_storage_layout(&self, contract: Address) -> StorageLayout {
+        let layouts = self.contract_layouts.read().await;
+
+        if let Some(layout) = layouts.get(&contract) {
+            layout.clone()
+        } else {
+            self.infer_default_layout(contract).await
+        }
+    }
+
+    async fn infer_default_layout(&self, _contract: Address) -> StorageLayout {
+        let mut slots = HashMap::new();
+        let mut mappings = HashMap::new();
+
+        // Common ERC20 + Uniswap V2 slots
+
+        slots.intert(0, SlotInfo {
+            slot: 0,
+            semantic_meaning: SlotSemantic::Ownership,
+            criticality: CriticalityLevel::Higt,
+            typical_change_rate: 0.1,
+        });
+
+        slot.intert(8, SlotInfi {
+            slot: 8,
+            semantic_meaning: SlotSemantic::Reserve,
+            criticality:  CriticalLevel::Critical,
+            typical_change_rate: 0.8,
+        });
+
+        slot.insert(9, SlotInfo {
+            slot: 9,
+            semantic_meaning: SlotSemantic::Reserve,
+            criticality: CriticalLevel::Critical,
+            typical_change_rate: 0.8,
+        });
+
+        mappings.insert(1, MappingInfo {
+            base_slot: 1,
+            key_type: "address".to_string(),
+            value_type: "uint256".to_string(),
+            hot_key: Vec::new(),
+        });
+
+        StorageLayout {
+            slots,
+            mappings,
+            contract_type: ContractType::UniswapV2Pair,
+        }
+    }
+
+    /// Classify event by signature
+    fn classify_event(&self, signature: H256) -> EventType {
+        let sig_str = format!("{:x}", signature);
+
+        match sig_str.as_str() {
+            // ERC20 Transfer 
+            "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" => EventType::Transfer,
+            // Uniswap V2 swap
+            "d78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822" => EventType::Swap,
+            // Uniswap V2 Sync
+            "1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1" => EventType::Sync,
+            _ => EventType::Unknown,
+        }
+    }
+
+    /// Calculate impact score for balance changes
+    fn calculate_balance_impact(&self, transfer_amount: U256, old_balance: U256) ->f64 {
+        if old_balance.is_zero() {
+            return 1.0;
+        }
+
+        let ratio = transfer_amoutn.as_u128() as f64 / old_balance.as_u128() as f64;
+        ratio.min(1.0)
+    }
+
+    /// Calculate impact score for reserve changes
+    fn calculate_reserve_impact(&self, old_reserve:  U256, new_reserve: U256) -> f64 {
+        if old_reserve.is_zero() {
+            return 1.0;
+        }
+
+        let change = if new_reserve > old_reserve {
+            new_reserve - old_reserve
+        } else {
+            old_reserve - new_reserve
+        };
+
+        let ratio = change.as_u128() as f64 / old_reserve.as_u128() as f64;
+        (ratio * 2.0).min(1.0) // Rserve change are high impact 
+    }
+
+    // Get drift events for a specific block range
+    pub async fn get_drift_events(&self, from_block: u64, to_block: u64) -> Vec<SlotDriftEvent> {
+        let history = self.drift_history.read().await;
+        let mut events = Vec::new();
+
+        for block_num in from_block..=to_block {
+            if let Some(block_events) = history.get(&block_num) {
+                events.extend_from_slice(block_events);
+            }
+        }
+
+        events
+    }
+
+    /// Get summary statistics
+    pub async fn get_statistics(&self) -> DetectorStatistics {
+        let history = self.drif_history.read().await;
+        let total_events = history.values().map(|events| events.len()).sum();
+        let total_blocks = history.len();
+
+        let avg_confidence = if  total_events > 0 {
+            history.values()
+                .flat_map(|events| events.iter())
+                .map(|event| event.confidence)
+                .sum::<f64>() / totat_events as f64
+        } else {
+            0.0
+        };
+
+        DetectorStatistics {
+            total_drift_events: total_events,
+            blocks_analyzed:  total_blocks,
+            average_confidence: avg_confidence,
+            active_contracts: history.value()
+                .flat_map(|events| events.iter())
+                .map(|event| event.contract)
+                .collect::<HashSet<_>>()
+                .len(),
+        }
+    }
+
+}
+
+
+#[derive(Debug)]
+    enum EventType {
+        Transfer,
+        Swap,
+        Sync,
+        Unknown,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DetectorStatistics {
+    pub total_drift_events: usize,
+    pub blocks_analyzed:  usize,
+    pub average_confidence: f64,
+    pub active_contracts: usize,
 }
