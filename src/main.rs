@@ -1,14 +1,16 @@
 
 mod config;
-mod scanner;
 mod macros; 
 mod const_and_addr;
+
 
 use config::ScannerConfig;
 use anyhow::Result;
 use dotenv::dotenv;
 
 use crate::scanner::MevScanner;
+use crate::storage::StorageDriftDetector;
+use crate::storage::SimpleStateCache;
 
 #[tokio::main]
 async fn main () -> Result<()>{
