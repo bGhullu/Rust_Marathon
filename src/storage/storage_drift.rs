@@ -1,18 +1,28 @@
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
-use std::collections::{HashMap, HashSet, BTreeMap, VecDeque};
-use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Mutex, Semaphore};
-use ethers::{prelude::*, types::{Address, Block, Log, H256, U256, Bytes}};
-use anyhow::{Result, Context, anyhow};
-use tracing::{info, debug, warn, error, instrument};
-use once_cell::sync::Lazy;
-use prometheus::{IntCounterVec, HistogramVec, IntGaugeVec};
+// use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+// use std::collections::{HashMap, HashSet, BTreeMap, VecDeque};
+// use std::time::{Duration, Instant};
+// use tokio::sync::RwLock;
+// use ethers::{prelude::*, types::{Address, Block, Log, H256, U256, Bytes}};
+// use anyhow::{Result, Context, anyhow};
+// use tracing::{info, debug, warn, error, instrument};
+// use once_cell::sync::Lazy;
+// use prometheus::{IntCounterVec, HistogramVec, IntGaugeVec};
+// use chrono::{DateTime, Utc};
+// use serde::{Serialize, Deserialize};
+// use rayon::prelude::*;
+// use dashmap::DashMap;
+// use bloom::{BloomFilter as InternalBloom, ASMS};
+// use lru::LruCache;
+
+
+use std::sync::Arc;
+use std::collections::{HashMap, HashSet, BTreeMap};
+use tokio::sync::RwLock;
+use ethers::types::{Address, Block, Log, H256, U256, TransactionReceipt};
+use anyhow::{Result, anyhow};
+use tracing::warn;
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
-use rayon::prelude::*;
-use dashmap::DashMap;
-use bloom::{BloomFilter as InternalBloom, ASMS};
-use lru::LruCache;
 
 
 // use crate::{
@@ -22,34 +32,34 @@ use lru::LruCache;
 //     utils::crypto::{keccak256_optimized, calculate_mapping_slot},
 // };
 
-static STORAGE_METRICS: Lazy<HistogramVec> = Lazy::new(|| {
-    HistogramVec::new(
-        prometheus::new("storage_analysis_duration", "TIme spent analayzing storage changes")
-            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]),
-            &["operation", "contract_type"]
-    ).unwrap()
+// static STORAGE_METRICS: Lazy<HistogramVec> = Lazy::new(|| {
+//     HistogramVec::new(
+//         prometheus::new("storage_analysis_duration", "TIme spent analayzing storage changes")
+//             .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]),
+//             &["operation", "contract_type"]
+//     ).unwrap()
     
-});
+// });
 
-static DRIFT_DETECTION_ACCURACY: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(
-        prometheus::new("drift_detection_accuracy", "Accuracy of drift detection predictions")
-        &["prediction", "contract"]
-    ).unwrap()
-});
+// static DRIFT_DETECTION_ACCURACY: Lazy<IntGaugeVec> = Lazy::new(|| {
+//     IntGaugeVec::new(
+//         prometheus::new("drift_detection_accuracy", "Accuracy of drift detection predictions")
+//         &["prediction", "contract"]
+//     ).unwrap()
+// });
 
-static PATTERN_CACHE_HITS: Lazy<IntCounterVec> = Lazy::new(|| {
-    IntCounterVec::new(
-        prometheus::Opts::new("pattern_cache_hits", "Storage pattern cache hits"),
-        &["pattern_type"]
-    ).unwrap()
-});
+// static PATTERN_CACHE_HITS: Lazy<IntCounterVec> = Lazy::new(|| {
+//     IntCounterVec::new(
+//         prometheus::Opts::new("pattern_cache_hits", "Storage pattern cache hits"),
+//         &["pattern_type"]
+//     ).unwrap()
+// });
 
 // Core Data structure
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SlotKey {
-    Cutom(H256),
-    BalanceOf(Addresss),
+    Custom(H256),
+    BalanceOf(Address),
     Reserves(u64),
 }
 
@@ -60,7 +70,7 @@ pub struct SlotDriftEvent {
     pub slot_key: SlotKey,
     pub current_value: H256,
     pub predicted_value: H256,
-    pub currecnt_block: u64,
+    pub current_block: u64,
     pub predicted_block: u64,
     pub timestamp: DateTime<Utc>,
     pub confidence: f64,
@@ -91,7 +101,7 @@ pub enum StorageChangeType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageLayout {
-    pub slots: HashMap<u64, StorageSlotInfo>,
+    pub slots: HashMap<u64, SlotInfo>,
     pub mappings: HashMap<u64, MappingInfo>,
     // pub arrays: HashMap<u64, ArrayInfo>,
     // pub structs: HashMap<u64, StructInfo>,
@@ -115,7 +125,7 @@ pub struct MappingInfo {
     pub base_slot: u64,
     pub key_type: String,
     pub value_type: String,
-    pub known_keys: HashSet<H256>,
+    // pub known_keys: HashSet<H256>,
     pub hot_keys: Vec<H256>, // Fequently accessed keys
 }
 
@@ -168,7 +178,7 @@ pub enum SlotSemantic {
 //     Random,
 // }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartiallyOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CriticalLevel {
     Low = 1 ,
     Medium = 2,
@@ -239,7 +249,7 @@ impl SimpleStateCache {
 
     pub async fn store_slot_value(&self, contract: Address, slot: SlotKey, value: H256) {
         let mut cache = self.slot_values.write().await;
-        cache.entry((contract, slot)).or_default().push(value);
+        cache.entry((contract, slot.clone())).or_default().push(value);
 
     // Keep only last 100 values per slot
         if let Some(values) = cache.get_mut(&(contract,slot)) {
@@ -285,7 +295,7 @@ impl StorageDriftDetector {
         println!("🔍 Analyzing block {} with {} transcations", block_number, receipts.len());
 
         // Step 1: Extract storage changes from transaction log
-        let storage_deltas = self.extract_storage_changes(&recipts,block_numnber).await?;
+        let storage_deltas = self.extract_storage_changes(&receipts,block_number).await?;
 
         // Step 2: Update our cache with new values
         self.update_cache(&storage_deltas).await;
@@ -306,12 +316,12 @@ impl StorageDriftDetector {
 
         for receipt in receipts {
             if let Some(contract_address) = receipt.to{
-                // Get or infer storage layour for this contract
+                // Get or infer storage layout for this contract
                 let layout = self.get_storage_layout(contract_address).await;
 
                 // Analyze each log for storage implications
-                for log in &recipt.logs{
-                    let log_deltas = self.analyse_log(log, &layout, block_number, contract_address).await?;
+                for log in &receipt.logs{
+                    let log_deltas = self.analyze_log(log, &layout, block_number, contract_address).await?;
                     deltas.extend(log_deltas);
                 }
 
@@ -331,7 +341,7 @@ impl StorageDriftDetector {
         let event_signature = log.topics[0];
 
         // Handle known event types
-        match self.classify_event(event_singature) {
+        match self.classify_event(event_signature) {
             EventType::Transfer => {
                 deltas.extend(self.handle_transfer_event(log,layout, block_number, contract).await?);
 
@@ -344,7 +354,7 @@ impl StorageDriftDetector {
             }
             EventType::Unknown => {
                 // Try generic analysis
-                deltas.extend(self.handle_unknow_event(log, layout, block_number, contract).await?);
+                deltas.extend(self.handle_unknown_event(log, layout, block_number, contract).await?);
             }
         }
 
@@ -352,7 +362,7 @@ impl StorageDriftDetector {
     } 
 
     /// Handle ERC20 Transfer events
-    async fn handle_transfer_event(&self, log: &Log, layout: &StorageLayout, block_number: u64, contract: Address) -> Result<Vec<StorageDelta>> {
+    async fn handle_transfer_event(&self, log: &Log, _layout: &StorageLayout, block_number: u64, contract: Address) -> Result<Vec<StorageDelta>> {
         let mut deltas = Vec::new();
 
         if log.topics.len() >= 3 && log.data.len() >=32 {
@@ -363,14 +373,15 @@ impl StorageDriftDetector {
             // Generate balance changes for sender and receiver
 
             if from != Address::zero(){
-                if let Some(old_balance) = self.cache.get_lastest_value(contract, SlotKey::BalanceOf(from)).await {
-                   let new_balance = U256::from(old_balance).saturating_sub(amoutn);
-                   deltas.push(StorageDelt{
+                if let Some(old_balance) = self.cache.get_latest_value(contract, SlotKey::BalanceOf(from)).await {
+                   let old_balance_u256 = self._bytes32_to_u256(old_balance);
+                   let new_balance = old_balance_u256.saturating_sub(amount);
+                   deltas.push(StorageDelta {
                     slot_key: SlotKey::BalanceOf(from),
                     old_value: old_balance,
-                    new_value: H256::from(new_balance),
+                    new_value: self._u256_to_bytes32(new_balance),
                     change_type: StorageChangeType::MappingUpdate,
-                    impact_score: self.calculate_balance_impact(amount, U256::from(old_balance)),
+                    impact_score: self.calculate_balance_impact(amount, old_balance_u256),
                     confidence: 0.95,
                     block_number,
                     contract,
@@ -380,13 +391,14 @@ impl StorageDriftDetector {
             
             if to != Address::zero(){
                 if let Some(old_balance) = self.cache.get_latest_value(contract, SlotKey::BalanceOf(to)).await{
-                    let new_balance = U256::from(old_balance).saturating_add(amount);
-                    deltas.push(StorageDelt{
+                    let old_balance_u256 = self._bytes32_to_u256(old_balance);
+                    let new_balance = old_balance_u256.saturating_add(amount);
+                    deltas.push(StorageDelta {
                         slot_key: SlotKey::BalanceOf(to),
                         old_value: old_balance,
-                        new_valeu: H256::from(new_balance),
-                        change_type: StorageChagneType::MappingUpdate,
-                        impact_score: self.calculate_balance_impact(amount, U256::from(old_balance)),
+                        new_value: self._u256_to_bytes32(new_balance),
+                        change_type: StorageChangeType::MappingUpdate,
+                        impact_score: self.calculate_balance_impact(amount, old_balance_u256),
                         confidence: 0.95,
                         block_number,
                         contract,
@@ -402,40 +414,41 @@ impl StorageDriftDetector {
     async fn handle_swap_event(&self, log:&Log, layout:&StorageLayout, block_number: u64, contract: Address) -> Result<Vec<StorageDelta>>{
         let mut deltas = Vec::new();
 
-        if log.data.len >= 128 { // 4 uint256 values
+        if log.data.len() >= 128 { // 4 uint256 values
             let amount0_in = U256::from_big_endian(&log.data[0..32]);
             let amount1_in = U256::from_big_endian(&log.data[32..64]);
             let amount0_out = U256::from_big_endian(&log.data[64..96]);
             let amount1_out = U256::from_big_endian(&log.data[96..128]);  
-        }
+        
 
-        // Update reserve slots (typically slot 8 and 9 for Uniswap V2)
-        for reserve_slot in [8u64, 9u64] {
-            if let Some(slot_info) = layout.slots.get(&reserve_slot) {
-               if slot_info.semantic_meaning == SlotSemantic::Reserve {
-                    if let Some(old_reserve) = self.cache.get_latest_value(contract, SlotKey::Resevers(reserve_slot)).await{
-                        let (delta_in, delta_out) = if reserve_slot == 8 {
-                            (amount0_in, amount0_out)
-                        } else {
-                            (amount1_in, amount1_out)
-                        };
+            // Update reserve slots (typically slot 8 and 9 for Uniswap V2)
+            for reserve_slot in [8u64, 9u64] {
+                if let Some(slot_info) = layout.slots.get(&reserve_slot) {
+                if slot_info.semantic_meaning == SlotSemantic::Reserve {
+                        if let Some(old_reserve) = self.cache.get_latest_value(contract, SlotKey::Reserves(reserve_slot)).await{
+                            let (delta_in, delta_out) = if reserve_slot == 8 {
+                                (amount0_in, amount0_out)
+                            } else {
+                                (amount1_in, amount1_out)
+                            };
 
-                        let old_reserve_u256 = U256::from(old_reserve);
-                        let new_reserve = old_reserve_u256.saturating_add(delt_in).saturating_sub(delta_out);
+                            let old_reserve_u256 = self._bytes32_to_u256(old_reserve);
+                            let new_reserve = old_reserve_u256.saturating_add(delta_in).saturating_sub(delta_out);
 
-                        deltas.push(StorageDelta {
-                            slot_key: SlotKey::Reserves(reserve_slot),
-                            old_value: old_reserve,
-                            new_value:  H256::from(new_reserve),
-                            change_type: StorageChangeType::DirectWire,
-                            impact_score: self.calculate_reserve_impact(old_reserve_u256, new_reserve),
-                            confidence: 0.98,
-                            block_number,
-                            contract,
-                        });
-                    }
+                            deltas.push(StorageDelta {
+                                slot_key: SlotKey::Reserves(reserve_slot),
+                                old_value: old_reserve,
+                                new_value:  self._u256_to_bytes32(new_reserve),
+                                change_type: StorageChangeType::DirectWrite,
+                                impact_score: self.calculate_reserve_impact(old_reserve_u256, new_reserve),
+                                confidence: 0.98,
+                                block_number,
+                                contract,
+                            });
+                        }
 
-               } 
+                } 
+                }
             }
         }
 
@@ -443,24 +456,24 @@ impl StorageDriftDetector {
     }
 
     /// Handle Uniswap Sync events (contains current reserves)
-    async fn sync_event(&self, log:&Log, layout: &StorageLayout, block_number: u64, contract: Address) -> Result<Vec<StorageDelta>> {
+    async fn handle_sync_event(&self, log:&Log, _layout: &StorageLayout, block_number: u64, contract: Address) -> Result<Vec<StorageDelta>> {
         let mut deltas = Vec::new();
 
         if log.data.len() >=64 { // 2 uint112 value (padded to 32 bytes each)
             let reserve0 = U256::from_big_endian(&log.data[0..32]);
             let reserve1 = U256::from_big_endian(&log.data[32..64]);
 
-            let reserve = [reserve0, reserve1];
+            let reserves = [reserve0, reserve1];
             for (i, reserve_slot) in [8u64, 9u64].iter().enumerate() {
-                if let Some(old_reserve) = self.cache.get_lastest_value(contract, SlotKey::Reserve(*reserve_slot)).await {
-                    let new_reserve = H256::from(reserve[i]);
+                if let Some(old_reserve) = self.cache.get_latest_value(contract, SlotKey::Reserves(*reserve_slot)).await {
+                    let new_reserve = self._u256_to_bytes32(reserves[i]);
                     if old_reserve != new_reserve {
-                        deltas.push(StorageDelt {
+                        deltas.push(StorageDelta {
                             slot_key: SlotKey::Reserves(*reserve_slot),
                             old_value: old_reserve,
                             new_value: new_reserve,
                             change_type: StorageChangeType::DirectWrite,
-                            impact_score: self.calculate_reserve_impact(U256::from(old_reserve), reserves[i]),
+                            impact_score: self.calculate_reserve_impact(self._bytes32_to_u256(old_reserve), reserves[i]),
                             confidence: 0.99, // Very high confidence for Sync events
                             block_number,
                             contract,
@@ -472,9 +485,9 @@ impl StorageDriftDetector {
         Ok(deltas)
     }
 
-    async fn handle_unknown_event(&self, log: &Log, layout: &StorageLayout, block_number:u64, contract: Address) -> Result<Vec<StorageDelta>> {
+    async fn handle_unknown_event(&self, _log: &Log, _layout: &StorageLayout, _block_number:u64, _contract: Address) -> Result<Vec<StorageDelta>> {
         // For MVP, we just return empty - could implement heuristic analysis here
-        Ok(Vev::new())
+        Ok(Vec::new())
     }
 
     /// Detect drift events from storage changes
@@ -490,12 +503,12 @@ impl StorageDriftDetector {
         // Check for drit indicators 
         let drift_score = self.calculate_drift_score(&changes, contract, slot_key.clone()).await;
 
-        if drift_score > self.anomaly_thresold {
+        if drift_score > self.anomaly_threshold {
             // Predict future value
-            let predict_value = self.predict_future_value(contract, slot_key.clone()).await;
-            let current_value = changes.last().unwarp().new_value;
+            let predicted_value = self.predict_future_value(contract, slot_key.clone()).await;
+            let current_value = changes.last().unwrap().new_value;
 
-            drift_events.puhs(SlotDriftEvent {
+            drift_events.push(SlotDriftEvent {
                 chain: "ethereum".to_string(),
                 contract,
                 slot_key,
@@ -513,7 +526,7 @@ impl StorageDriftDetector {
     } 
 
     /// Calculate drift score for a set of changes
-    async fn calculate_drift_score(&self, changes: &[StorageDelta], contract: Address, slot_key: SlotKey) -> f64 {
+    async fn calculate_drift_score(&self, changes: &[&StorageDelta], contract: Address, slot_key: SlotKey) -> f64 {
         if changes.is_empty() {
            return 0.0; 
         }
@@ -526,13 +539,13 @@ impl StorageDriftDetector {
         }
 
         // Factor 2: Average impact score
-        let avg_impact:  f64 = changes.iter().map(|c| c.impact.score).sum::<f64>() / changes.len() as f64;
-        score += ave_impact * 0.4;
+        let avg_impact:  f64 = changes.iter().map(|c| c.impact_score).sum::<f64>() / changes.len() as f64;
+        score += avg_impact * 0.4;
 
         // Factor 3: Volatility based on historical data
         let history = self.cache.get_slot_history(contract, slot_key).await;
         if history.len() > 10 {
-            let volatility = self.calculate_volatility(&history);
+            let volatility = self.calculate_valatility(&history);
             score += volatility * 0.3;
         }
 
@@ -545,14 +558,14 @@ impl StorageDriftDetector {
             return 0.0;
         }
 
-        let numeric_values: Vec<f64> = values.iter().map(|h| h.low_u64() as f64).collect();
-        let mean = numeric_values.iter().sum::<f64>() / numeric_value.len() as f64;
+        let numeric_values: Vec<f64> = values.iter().map(|h| h.to_low_u64_be() as f64).collect();
+        let mean = numeric_values.iter().sum::<f64>() / numeric_values.len() as f64;
 
-        let variance = num_value.iter()
+        let variance = numeric_values.iter()
             .map(|&x| (x-mean).powi(2))
-            .sum::<f64>() / numeric_value.len() as f64;
+            .sum::<f64>() / numeric_values.len() as f64;
         
-        (variance.sqrt()/ mean.max(1.0))
+        variance.sqrt()/ mean.max(1.0)
 
     } 
 
@@ -568,7 +581,7 @@ impl StorageDriftDetector {
         let recent_values: Vec<f64> = history.iter()
             .rev()
             .take(10)
-            .map(|h| h.low_u64() as f64)
+            .map(|h| h.to_low_u64_be() as f64)
             .collect();
         
         if recent_values.len() < 2 {
@@ -585,19 +598,20 @@ impl StorageDriftDetector {
     /// Update cache with new storage deltas
     async fn update_cache(&self, deltas: &[StorageDelta]) {
         for delta in deltas {
-            slot.cache.store_slot_value(delta.contract, delta.slot_key.clone(),  delta.new_value).await;
+            self.cache.store_slot_value(delta.contract, delta.slot_key.clone(),  delta.new_value).await;
         }
     }
+    
 
     /// Store drift events in history
     async fn store_drift_events(&self, block_number: u64, events: &[SlotDriftEvent]) {
         let mut history = self.drift_history.write().await;
-        history.insert(block_number, events.to.vec());
+        history.insert(block_number, events.to_vec());
 
         // Keep only last 1000 blocks
-        if history.len> 1000 {
+        if history.len() > 1000 {
             let cutoff = block_number.saturating_sub(1000);
-            history.retian(|&k, _| k > cutoff);
+            history.retain(|&k, _| k > cutoff);
         }
     }
 
@@ -618,32 +632,32 @@ impl StorageDriftDetector {
 
         // Common ERC20 + Uniswap V2 slots
 
-        slots.intert(0, SlotInfo {
+        slots.insert(0, SlotInfo {
             slot: 0,
             semantic_meaning: SlotSemantic::Ownership,
-            criticality: CriticalityLevel::Higt,
+            criticality: CriticalLevel::High,
             typical_change_rate: 0.1,
         });
 
-        slot.intert(8, SlotInfi {
+        slots.insert(8, SlotInfo {
             slot: 8,
             semantic_meaning: SlotSemantic::Reserve,
             criticality:  CriticalLevel::Critical,
             typical_change_rate: 0.8,
         });
 
-        slot.insert(9, SlotInfo {
+        slots.insert(9, SlotInfo {
             slot: 9,
             semantic_meaning: SlotSemantic::Reserve,
             criticality: CriticalLevel::Critical,
             typical_change_rate: 0.8,
         });
 
-        mappings.insert(1, MappingInfo {
+        mappings.insert(1, MappingInfo{
             base_slot: 1,
             key_type: "address".to_string(),
             value_type: "uint256".to_string(),
-            hot_key: Vec::new(),
+            hot_keys: Vec::new(),
         });
 
         StorageLayout {
@@ -674,8 +688,21 @@ impl StorageDriftDetector {
             return 1.0;
         }
 
-        let ratio = transfer_amoutn.as_u128() as f64 / old_balance.as_u128() as f64;
+        let ratio = transfer_amount.as_u128() as f64 / old_balance.as_u128() as f64;
         ratio.min(1.0)
+    }
+
+    /// Helpers for H256/U256 conversion
+    #[inline]
+    fn _bytes32_to_u256(&self, b: H256) -> U256 {
+        U256::from_big_endian(b.as_bytes())
+    }
+
+    #[inline]
+    fn _u256_to_bytes32(&self, u: U256) -> H256 {
+        let mut buf = [0u8; 32];
+        u.to_big_endian(&mut buf);
+        H256::from(buf)
     }
 
     /// Calculate impact score for reserve changes
@@ -710,7 +737,7 @@ impl StorageDriftDetector {
 
     /// Get summary statistics
     pub async fn get_statistics(&self) -> DetectorStatistics {
-        let history = self.drif_history.read().await;
+        let history = self.drift_history.read().await;
         let total_events = history.values().map(|events| events.len()).sum();
         let total_blocks = history.len();
 
@@ -718,7 +745,7 @@ impl StorageDriftDetector {
             history.values()
                 .flat_map(|events| events.iter())
                 .map(|event| event.confidence)
-                .sum::<f64>() / totat_events as f64
+                .sum::<f64>() / total_events as f64
         } else {
             0.0
         };
@@ -727,7 +754,7 @@ impl StorageDriftDetector {
             total_drift_events: total_events,
             blocks_analyzed:  total_blocks,
             average_confidence: avg_confidence,
-            active_contracts: history.value()
+            active_contracts: history.values()
                 .flat_map(|events| events.iter())
                 .map(|event| event.contract)
                 .collect::<HashSet<_>>()

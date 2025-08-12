@@ -1,4 +1,6 @@
 
+mod scanner;
+mod storage;
 mod config;
 mod macros; 
 mod const_and_addr;

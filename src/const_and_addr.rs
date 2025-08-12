@@ -1,9 +1,12 @@
+#![allow(unused_variables)]
 
 use std::time::Duration;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio::sync::Semaphore;
 use ethers::types::{Address, H256, TransactionReceipt};
 use std::str::FromStr;
+
+
 
 // Network connection
 pub const COOL_DOWN_PERIOD: Duration = Duration::from_secs(30);

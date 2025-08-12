@@ -53,7 +53,7 @@ impl ScannerConfig {
             (circuit_breaker_threshold: usize),
     );
     pub fn from_env() -> Result<Self> {
-        dotenv::dotenv();
+        let _ = dotenv::dotenv();
         let primary_rpc_url = std::env::var("WS_URL")
             .context("Missing WS_URL in enviornment")?;
         let fallback_rpc_url= std::env::var("HTTP_URL")

@@ -1,18 +1,17 @@
 //! Core MEV scanner implementation
 //!
 //! The MevScanner orchestrates all components to detect arbitrage opportunities
-//! by monitoring blockchain state changes and anaylyzing price differences.
-
+//! by monitoring blockchain state changes and anaylyzing price differences
 use std::{
     sync::{Arc, atomic::{AtomicU64, Ordering}}, 
     time::{Duration, Instant},
 };
 use tokio::{
     time::{sleep, timeout},
-    sync::{Notify, Mutex,Semaphore},
+    sync::{Notify, Mutex,Semaphore, RwLock},
 };
 use ethers::{
-    providers::{Http, Middleware, Provider, StreamExt, Ws},
+    providers::{Http, Middleware, Provider, StreamExt, Ws, JsonRpcClient},
     types::{transaction, Address, Block, Log, Transaction, TransactionReceipt, H256, U256},
 };
 use futures::stream::{self, StreamExt as FuturesStreamExt};
@@ -33,7 +32,7 @@ use crate::{
     // providers::ProviderManager,
     storage::{
         StorageDriftDetector, SlotDriftEvent,  SlotKey, StorageDelta,
-        StorageChagneType, SlotSemantic, CriticalLevel,
+        StorageChangeType, SlotSemantic, CriticalLevel,
     },
 }; 
 use super::{BloomFilter, CircuitBreaker};
@@ -51,8 +50,8 @@ const DRIFT_CONFIDENCE_THRESHOLD: f64 = 0.8;
 /// Main MEV scanner that coordinates all components
 pub struct MevScanner {
 
-    /// Primary WebSocket provider (wrapped in Mutex for reconnection)
-    primary_provider: Arc<Mutex<Arc<Provider<Ws>>>>,
+    /// Primary WebSocket provider (None when disconnected)
+    primary_provider: Arc<Mutex<Option<Arc<Provider<Ws>>>>>,
 
     // Fallback HTTP provider
     fallback_provider: Arc<Provider<Http>>,
@@ -134,22 +133,21 @@ impl MevScanner {
         // Try to initalize WebSocket provider
         let primary_provider = match Provider::<Ws>::connect(ws_endpoint).await{
             Ok(ws_provider) => {
-                info!("✅ WebSocket provider connected successfully......");
+                info!("✅ WebSocket provider connected successfully....");
                 initial_connection_state.ws_connected = true;
-                Arc::new(Mutex::new(Arc::new(ws_provider)))
+                Arc::new(Mutex::new(Some(Arc::new(ws_provider))))
             }
             Err(e) => {
                 warn!("⚠️ WebSocket connection failed, will retry: {}", e);
-                // Create a placeholder - will be replaced on reconnect
-                let dummy_ws =  create_dummy_ws_provider().await?; // ------------------------------------------------------
-                Arc::new(Mutex::new(Arc::new(dummy_ws)))
+                Arc::new(Mutex::new(None))
+           
             }
         };
 
-        let provider_manager = ProviderManager::new(
-            ws_endpoint,
-            http_endpoint,
-        ).await?;
+        // let provider_manager = ProviderManager::new(
+        //     ws_endpoint,
+        //     http_endpoint,
+        // ).await?;
 
         let ws_endpoint = &config.primary_rpc_url();
 
@@ -193,7 +191,7 @@ impl MevScanner {
             last_block: AtomicU64::new(0),
             connection_state: Arc::new(Mutex::new(initial_connection_state)),
             ws_reconnected: Arc::new(Notify::new()),
-            recent_drift_events:  Arc::new(RwLock::new(Vec::new()));
+            recent_drift_events:  Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -215,8 +213,8 @@ impl MevScanner {
             tokio::select!{
                 _ = shutdown_rx.recv() => {
                     info!("🛑 Shutdown signal received. Exiting run cycle loop....");
-                    mempool_task.abort();
-                    break Ok(());
+                    // mempool_task.abort();
+                    return Ok(());
                 }
                 _ = async {
                     if self.circuit_breaker.is_tripped().await {
@@ -230,7 +228,8 @@ impl MevScanner {
                                 let mut state = self.connection_state.lock().await;
                                 state.last_success= Instant::now();
                                 state.consecutive_errors = 0;
-                                self.circuit_breaker.reset(); // do we need to reset it all the time ???
+                // reset on success to clear consecutive error streak
+                self.circuit_breaker.reset().await;
                             }
                             Err(e) => {
                                 warn!("❌ WS processing error: {:?}",e);
@@ -259,28 +258,65 @@ impl MevScanner {
         Ok(())
     }
 
-    fn start_mempool_monitoring(&self) -> tokio::task::JoinHandle<()>{
-        let mempool_watcher = self.mempool_watcher.clone();
-        let arbitrage_detector = self.arbitrage_detector.clone();
+    // fn start_mempool_monitoring(&self) -> tokio::task::JoinHandle<()>{
+    //     let mempool_watcher = self.mempool_watcher.clone();
+    //     let arbitrage_detector = self.arbitrage_detector.clone();
+
+    //     tokio::spawn(async move{
+    //         loop {
+    //             if let Ok(mut watcher) = mempool_watcher.try_lock() {
+    //                 if let Ok(pending_txs) = watcher.get_pending_transactions().await {
+    //                     for tx in pending_txs {
+    //                         if let Ok(opportunities) = arbitrage_detector.analyze_transaction(&tx).await {
+    //                             info!("📊 Mempool arbitrage opportunity");
+    //                             self.handle_opportunities(opportunities).await;
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     })
+    // }
+
+    fn start_drift_monitoring(&self) -> tokio::task::JoinHandle<()>{
+        let drift_detector = self.storage_drift_detector.clone();
+        let drift_events = self.recent_drift_events.clone();
 
         tokio::spawn(async move{
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+
             loop {
-                if let Ok(mut watcher) = mempool_watcher.try_lock() {
-                    if let Ok(pending_txs) = watcher.get_pending_transactions().await {
-                        for tx in pending_txs {
-                            if let Ok(opportunities) = arbitrage_detector.analyze_transaction(&tx).await {
-                                info!("📊 Mempool arbitrage opportunity")
-                                self.handle_opportunities(opportunities).await;
-                            }
-                        }
-                    }
+                interval.tick().await;
+
+                // Get recent drift statistics
+                let stats = drift_detector.get_statistics().await;
+
+                if stats.total_drift_events > 0 {
+                    info!("📊 Drift Statistics: {} events across {} contracts (avg confidence: {:.2})",
+                        stats.total_drift_events,
+                        stats.active_contracts,
+                        stats.average_confidence);
+                }
+
+                // Clean up old drift events (keep only recent for analysis)
+                let mut events = drift_events.write().await;
+                if events.len() > 1000 {
+                    let len_now = events.len();
+                    events.drain(0..len_now - 1000);
                 }
             }
         })
     }
 
+    fn get_statistics() {
+        
+    }
+
     pub async fn process_ws_blocks(&self) -> Result<()> {
-        let provider = self.primary_provider.lock().await.clone();
+        let provider_opt = self.primary_provider.lock().await.clone();
+        let Some(provider) = provider_opt else {
+            return Err(anyhow!("WebSocket provider not available"));
+        };
         let mut stream = provider
             .subscribe_blocks()
             .await
@@ -291,7 +327,7 @@ impl MevScanner {
             self.update_connection_success().await;
 
             if let Err(e) = self.process_block_immediately(block).await {
-                error!("❌ Block processing error: {;?}, e");
+                error!("❌ Block processing error: {:?}", e);
                 self.handle_connection_error().await;
 
                 if self.connection_state.lock().await.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
@@ -346,12 +382,9 @@ impl MevScanner {
         if let Some(number) = block.number.map(|n| n.as_u64()) {
             debug!("⚡️ Processing block {} immediately", number);
 
-            match timeout(BLOCK_PROCESSING_TIMEOUT, self.process_single_block(number)).await {
-                Ok(Ok(opportunities)) => {
-                    if !opportunities.is_emppty() {
-                        info!("💰 Found {} MEV opportunities in block {} ({}ms)",opportunities.len(), number, start_time.elapsed().as_millis());
-                        self.handle_opportunities(opportunities).await;
-                    }
+            match timeout(BLOCK_PROCESSING_TIMEOUT, self.process_single_block(block.clone())).await {
+                Ok(Ok(())) => {
+                    info!("✅ Block {} processed ({}ms)", number, start_time.elapsed().as_millis());
                     self.last_block.store(number,Ordering::Relaxed);
                 }
                 Ok(Err(e))=> {
@@ -367,7 +400,7 @@ impl MevScanner {
         Ok(())
     }
 
-    async fn process_single_block_by_number(&self, number: u64) -> Result<Vec<ArbitrageOpportunity>> {
+    async fn process_single_block_by_number(&self, number: u64) -> Result<()> {
         let block = self.fallback_provider
             .get_block(number)
             .await?
@@ -376,8 +409,8 @@ impl MevScanner {
     }
 
 
-    async fn process_single_block(&self, block: Block<H256>) -> Result<Vec<ArbitrageOpportunity>> {
-        let start_time = Instan::now();
+    async fn process_single_block(&self, block: Block<H256>) -> Result<()> {
+        let _start_time = Instant::now();
         let block_number = block.number
             .ok_or_else(|| anyhow!("Block missing number!!!!"))?
             .as_u64();
@@ -389,77 +422,69 @@ impl MevScanner {
 
         // 2. Perform comprehensive storage drift analysis 
         let drift_events = self.storage_drift_detector
-            .analyse_block(&block, receipts)
+            .analyze_block(&block, receipts)
             .await?;
 
         let high_confidence_drifts = self.filter_high_confidence_drifts(&drift_events).await;
 
+        if !high_confidence_drifts.is_empty() {
+            info!("🚨 Detected {} high-confidence storage dirft events in block {}", 
+                high_confidence_drifts.len(), block_number);
 
+            // Store lightweight event data for recent analysis
+            let mut events = self.recent_drift_events.write().await;
+            events.extend(high_confidence_drifts.clone());
 
-
-
-
-
-
-
-
-
-
-        // 1. Detect changed storage slots via bloom filter and transaction analysis
-        let changed_slots = self.detect_changed_slots(&block).await?;
-
-        // 2. Update slot cache
-        changed_slots
-            .iter()
-            .for_each(|&(slot_key,value)|{
-                self.slot_cache.insert(slot_key,value);
-                self.bloom_filter.insert(&slot_key.to_le_bytes());
-            });
-
-        // 3. Get modified pools based on chanted slots
-        let modified_pools = self.get_modified_pools(&changed_slots).await?;
-
-        // 4. Find arbitrge opportunities
-        let mut opportunities = self.find_arbitrage(modified_pools).await?;
-        
-        // 5. Analyze individual transactions for MEV opportunities
-        if let Some(transactions) = &block.transactions {
-            for tx in transactions {
-                if let Ok(tx_opportunities) = self.analyze_transaction_for_mev(tx).await {
-                    opportunities.extend(tx_opportunities);
-                }
+            // Keep only recent events (last 1000 events, not blocks)
+            if events.len() > 1000 {
+                let len_now = events.len();
+                events.drain(0..len_now - 1000);
             }
         }
-   
-        Ok(opportunities)
+        Ok(())
     }
 
+
     async fn get_block_receipts(&self, block: &Block<H256>) -> Result<Vec<TransactionReceipt>> {
-        static RPC_SEMAPHORE: Lazy<Semaphore> = Lazy::new(||
-            Semaphore::new(MAX_RECEIPT_CONCURRENCY)
-        );
+       
 
-        let provider = self.primary_provider.lock().await.clone();
-
-        let receipts: Vec<TransactionReceipt> = stream::iter(&block.transactions)
-            .map(|tx_hash| {
-                let provider = provider.clone();
-                async move {
-                    let _permit = RPC_SEMAPHORE.acquire().await.unwrap();
-                    provider
-                        .get_transaction_receipt(*tx_hash)
-                        .await
-                        .ok()
-                        .flatten()
-                }
-            })
-            .buffered(MAX_RECEIPT_CONCURRENCY)
-            .filter_map(|x| async move { x })
-            .collect()
-            .await;
+        let receipts = if let Some(ws_provider) = self.primary_provider.lock().await.clone() {
+            self.fetch_receipts(ws_provider, block).await
+        } else {
+            self.fetch_receipts(self.fallback_provider.clone(), block).await
+        };
 
         Ok(receipts)
     }
+
+     // Helper closure: fetch all receipts from a provider of any connection type
+    async fn fetch_receipts<P: JsonRpcClient + 'static>(
+            &self,
+            provider: Arc<Provider<P>>,
+            block: &Block<H256>,
+        ) -> Vec<TransactionReceipt> {
+
+            static RPC_SEMAPHORE: Lazy<Semaphore> = Lazy::new(||
+            Semaphore::new(MAX_RECEIPT_CONCURRENCY)
+            );
+            stream::iter(&block.transactions)
+                .map(|tx_hash| {
+                    let provider = provider.clone();
+                    async move {
+                        let _permit = RPC_SEMAPHORE.acquire().await.unwrap();
+                        provider
+                            .get_transaction_receipt(*tx_hash)
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                })
+                .buffered(MAX_RECEIPT_CONCURRENCY)
+                .filter_map(|x| async move { x })
+                .collect()
+                .await
+    }
+
 
     async fn filter_high_confidence_drifts(&self, drift_events: &[SlotDriftEvent]) -> Vec<SlotDriftEvent> {
         drift_events
@@ -481,7 +506,7 @@ impl MevScanner {
         match Provider::<Ws>::connect(&self.ws_endpoint).await {
             Ok(new_provider) => {
                 info!("✅ WebSocket reconnection successful!");
-                *self.primary_provider.lock().await =Arc::new(new_provider);
+                *self.primary_provider.lock().await = Some(Arc::new(new_provider));
 
                 let mut state = self.connection_state.lock().await;
                 state.ws_connected = true;
@@ -600,4 +625,71 @@ impl MevScanner {
 
 //         Ok(())
 //     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers::{
+        providers::Provider,
+        signers::{LocalWallet, Signer},
+        types::TransactionRequest,
+        utils::Anvil,
+    };
+    use ethers_middleware::SignerMiddleware;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_block_receipts_via_anvil() -> anyhow::Result<()> {
+        // Start a local anvil with WS enabled
+        let anvil = Anvil::new().arg("--silent").arg("--ws").spawn();
+
+        // Configure env for ScannerConfig (PRIVATE_KEY just needs to be non-empty per current config)
+        unsafe {
+            std::env::set_var("WS_URL", anvil.ws_endpoint());
+            std::env::set_var("HTTP_URL", anvil.endpoint());
+            std::env::set_var("PRIVATE_KEY", "0xdeadbeef");
+        }
+
+        // Build scanner pointing to anvil
+        let config = ScannerConfig::from_env()?;
+        let scanner = MevScanner::new(config).await?;
+
+        // HTTP provider to create a transaction
+        let http_provider = Provider::<Http>::try_from(anvil.endpoint())?;
+        let chain_id = http_provider.get_chainid().await?.as_u64();
+
+        // Prepare signer from anvil funded account
+        let wallet1: LocalWallet = anvil.keys()[0].clone().into();
+        let wallet1 = wallet1.with_chain_id(chain_id);
+        let client = SignerMiddleware::new(http_provider.clone(), wallet1);
+
+        // Send a simple value transfer to a second anvil account
+        let wallet2: LocalWallet = anvil.keys()[1].clone().into();
+        let to = wallet2.address();
+        let tx = TransactionRequest::new()
+            .to(to)
+            .value(1_000_000_000u64) // 1 gwei
+            .from(anvil.addresses()[0]);
+
+        let pending = client.send_transaction(tx, None).await?;
+        let receipt = pending.confirmations(1).await?.expect("mined");
+        let block_number = receipt.block_number.expect("block num").as_u64();
+        let tx_hash = receipt.transaction_hash;
+
+        // Fetch the block by number
+        let block = client
+            .provider()
+            .get_block(block_number)
+            .await?
+            .expect("block exists");
+
+        // Call the method under test
+        let receipts = scanner.get_block_receipts(&block).await?;
+
+        // Validate we got the receipt and it matches the sent tx
+        assert!(!receipts.is_empty());
+        assert!(receipts.iter().any(|r| r.transaction_hash == tx_hash));
+
+        Ok(())
+    }
 }
